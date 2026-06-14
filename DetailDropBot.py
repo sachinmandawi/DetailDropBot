@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 import pymongo
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAFzsIOx2mWpxbXNdqlO7rr0n_BsxbTdYM4")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8439636405:AAHSflD05Q1Ss4h1NFhAM6zMeWszcgVha6s")
 
 # API URLs
 MOBILE_API = "https://numberto-info-noobster.com-dashbord63hh7qe4.workers.dev/?number={}"
@@ -49,6 +49,65 @@ logger = logging.getLogger(__name__)
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://TGHostingManagerBot:Z15kgFLgaOLUA84a@tghostingmanagerbot.pz1om5f.mongodb.net/")
 ADMIN_IDS = [8464435078]
 ADMIN_USERNAME = "NeoVirtuosa"
+
+# ==================== FORCE JOIN CONFIG ====================
+FORCE_JOIN_GROUP_ID = -1003987947941
+FORCE_JOIN_GROUP_LINK = "https://t.me/DetailDropGroup"
+FORCE_JOIN_CHANNEL_ID = -1003718462382
+FORCE_JOIN_CHANNEL_LINK = "https://t.me/DetailDrop"
+
+FORCE_JOIN_TEXT = """⚠️ <b>Access Locked: Member Verification</b>
+━━━━━━━━━━━━━━━━━━━━
+Please join our networks to search vehicle, mobile, PAN, and bank details:
+
+1. 💬 <a href="https://t.me/DetailDropGroup">Public Group</a>
+2. 📢 <a href="https://t.me/DetailDrop">Public Channel</a>
+━━━━━━━━━━━━━━━━━━━━"""
+
+def get_force_join_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💬 Join Group", url=FORCE_JOIN_GROUP_LINK),
+         InlineKeyboardButton("📢 Join Channel", url=FORCE_JOIN_CHANNEL_LINK)],
+        [InlineKeyboardButton("🔄 Verify Membership", callback_data="verify_force_join")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def check_force_join(user_id: int, bot) -> bool:
+    """Verify if user has joined both the public group and channel. Bot admins bypass this."""
+    if user_id in ADMIN_IDS:
+        return True
+        
+    # Check Group
+    try:
+        member = await bot.get_chat_member(chat_id=FORCE_JOIN_GROUP_ID, user_id=user_id)
+        if member.status not in ['member', 'restricted', 'administrator', 'creator']:
+            return False
+    except Exception as e:
+        logger.error(f"Error checking group membership for {user_id}: {e}")
+        return False
+        
+    # Check Channel
+    try:
+        member = await bot.get_chat_member(chat_id=FORCE_JOIN_CHANNEL_ID, user_id=user_id)
+        if member.status not in ['member', 'restricted', 'administrator', 'creator']:
+            return False
+    except Exception as e:
+        logger.error(f"Error checking channel membership for {user_id}: {e}")
+        return False
+        
+    return True
+
+def private_chat_only(func):
+    """Decorator to restrict handler execution strictly to private chats (DMs), except for bot admins"""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user and user.id in ADMIN_IDS:
+            return await func(update, context)
+            
+        if update.effective_chat and update.effective_chat.type != 'private':
+            return
+        return await func(update, context)
+    return wrapper
 
 try:
     mongo_client = pymongo.MongoClient(MONGO_URI)
@@ -131,24 +190,29 @@ def has_user_access_only(user_id):
 async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, bool, str, InlineKeyboardMarkup]:
     """Check if the user has an active free pass or has credit, checking ban and maintenance status first. Returns (allowed, masked, error_msg, reply_markup)"""
     user_id = user.id
-    
-    # 1. Ban Check
     user_data = db.users.find_one({"user_id": user_id})
+
+    # Admin has absolute access & bypasses all checks immediately
+    if user_id in ADMIN_IDS:
+        db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
+        if user_data:
+            db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
+        return True, False, "", None
+        
+    # 1. Ban Check
     if user_data and user_data.get('banned', False):
         return False, False, "❌ <b>Your account has been banned by the Administrator.</b>", None
         
     # 2. Maintenance Mode Check
     settings_doc = db.settings.find_one({"_id": "global_settings"})
     is_maintenance = settings_doc.get('maintenance_mode', False) if settings_doc else False
-    if is_maintenance and user_id not in ADMIN_IDS:
+    if is_maintenance:
         return False, False, "🔧 <b>Maintenance Mode Active:</b> The bot is temporarily undergoing scheduled updates. Please try again later.", None
         
-    # Admin has absolute access
-    if user_id in ADMIN_IDS:
-        db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
-        if user_data:
-            db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
-        return True, False, "", None
+    # 3. Force Join Check
+    joined = await check_force_join(user_id, context.bot)
+    if not joined:
+        return False, False, FORCE_JOIN_TEXT, get_force_join_keyboard()
         
     if not user_data:
         user_data = register_user(user)
@@ -636,6 +700,17 @@ def format_error(title, message):
 ⚠️ {escape_html(message)}
 {format_separator()}"""
 
+def handle_api_exception(name: str, e: Exception) -> str:
+    """Helper to convert request/decoding exceptions into user-friendly error text"""
+    import requests
+    if isinstance(e, requests.exceptions.Timeout):
+        return format_error(f"{name} Timeout", "The server took too long to respond. Please try again.")
+    elif isinstance(e, requests.exceptions.ConnectionError):
+        return format_error(f"{name} Offline", "Unable to establish connection to the database provider.")
+    elif isinstance(e, (json.JSONDecodeError, ValueError)):
+        return format_error(f"{name} Error", "Received an invalid response format from the database server.")
+    return format_error(f"{name} Error", str(e))
+
 def format_no_results(query):
     """Format no results message"""
     return f"""❌ <b>No Results</b>
@@ -789,7 +864,7 @@ async def search_mobile_info(number: str, masked: bool = False) -> str:
             raw_text = raw_text[:last_brace + 1]
         data = json.loads(raw_text)
         
-        if data.get('status') == 'success' and data.get('data', {}).get('records'):
+        if isinstance(data, dict) and data.get('status') == 'success' and data.get('data', {}).get('records'):
             record = data['data']['records'][0]
             
             result = format_header("📱", "MOBILE NUMBER DETAILS") + "\n"
@@ -811,7 +886,7 @@ async def search_mobile_info(number: str, masked: bool = False) -> str:
         
     except Exception as e:
         logger.error(f"Mobile search error: {e}")
-        return format_error("Error", str(e))
+        return handle_api_exception("Mobile API", e)
 
 async def search_vehicle_info(rc: str, api_choice: int = 1, masked: bool = False) -> str:
     """Search vehicle registration information"""
@@ -823,7 +898,7 @@ async def search_vehicle_info(rc: str, api_choice: int = 1, masked: bool = False
             )
             data = response.json()
             
-            if data.get('success') and data.get('vehicle_info'):
+            if isinstance(data, dict) and data.get('success') and data.get('vehicle_info'):
                 v = data['vehicle_info']
                 
                 result = format_header("🚗", "VEHICLE DETAILS") + "\n"
@@ -905,19 +980,18 @@ async def search_vehicle_info(rc: str, api_choice: int = 1, masked: bool = False
             )
             data = response.json()
             
-            if data:
+            if isinstance(data, dict) and data:
                 result = format_header("🚙", "VEHICLE DETAILS (API 2)") + "\n"
                 
                 # Check if there is a nested 'formatted' or 'Formatted' key
                 v_data = {}
-                if isinstance(data, dict):
-                    formatted = data.get('formatted', data.get('Formatted'))
-                    if isinstance(formatted, dict):
-                        v_data = formatted.get('all_fields', formatted)
-                    if not v_data:
-                        v_data = data.get('raw_data', data.get('Raw Data', {}))
-                    if not v_data:
-                        v_data = data
+                formatted = data.get('formatted', data.get('Formatted'))
+                if isinstance(formatted, dict):
+                    v_data = formatted.get('all_fields', formatted)
+                if not v_data:
+                    v_data = data.get('raw_data', data.get('Raw Data', {}))
+                if not v_data:
+                    v_data = data
                 
                 if isinstance(v_data, dict):
                     fields = {
@@ -978,7 +1052,7 @@ async def search_vehicle_info(rc: str, api_choice: int = 1, masked: bool = False
             
     except Exception as e:
         logger.error(f"Vehicle search error: {e}")
-        return format_error("Error", str(e))
+        return handle_api_exception("Vehicle API", e)
 
 async def search_pan_info(pan: str, masked: bool = False) -> str:
     """Search PAN card information"""
@@ -990,7 +1064,7 @@ async def search_pan_info(pan: str, masked: bool = False) -> str:
         )
         data = response.json()
         
-        if data.get('success') and data.get('pan_info'):
+        if isinstance(data, dict) and data.get('success') and data.get('pan_info'):
             p = data['pan_info']
             
             raw_gender = p.get('gender')
@@ -1026,7 +1100,7 @@ async def search_pan_info(pan: str, masked: bool = False) -> str:
         
     except Exception as e:
         logger.error(f"PAN search error: {e}")
-        return format_error("Error", str(e))
+        return handle_api_exception("PAN API", e)
 
 async def search_github_info(username: str, masked: bool = False) -> str:
     """Search GitHub profile information"""
@@ -1039,6 +1113,8 @@ async def search_github_info(username: str, masked: bool = False) -> str:
             return format_no_results(username)
         
         d = response.json()
+        if not isinstance(d, dict):
+            return format_error("GitHub API Error", "Invalid response format from server.")
         
         result = format_header("💻", "GITHUB PROFILE") + "\n"
         result += add_field("🔑", "Username", mask_val(d.get('login')) if masked else d.get('login'))
@@ -1061,7 +1137,7 @@ async def search_github_info(username: str, masked: bool = False) -> str:
         
     except Exception as e:
         logger.error(f"GitHub search error: {e}")
-        return format_error("Error", str(e))
+        return handle_api_exception("GitHub API", e)
 
 async def search_ifsc_info(ifsc: str, masked: bool = False) -> str:
     """Search bank information by IFSC code"""
@@ -1114,7 +1190,7 @@ async def search_ifsc_info(ifsc: str, masked: bool = False) -> str:
         
     except Exception as e:
         logger.error(f"IFSC search error: {e}")
-        return format_error("Error", str(e))
+        return handle_api_exception("IFSC API", e)
 
 def format_leak_page(results, query, page_index=0, masked=False):
     """Format a single page of leak results (5 records per page) and return (text, reply_markup)"""
@@ -1245,6 +1321,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     
+    # Check if banned (admins bypass)
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
+        if update.message:
+            await update.message.reply_text("❌ <b>Your account has been banned by the Administrator.</b>", parse_mode='HTML')
+        return
+
     # Check if this is a referral link (starts with ref_)
     ref_id = None
     if context.args and context.args[0].startswith("ref_"):
@@ -1253,9 +1336,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             pass
             
-    # Check if user already exists
-    user_data = db.users.find_one({"user_id": user_id})
-    
     if not user_data:
         # New user registration!
         user_data = register_user(user, ref_id)
@@ -1270,10 +1350,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to send welcome gift notification to {user_id}: {e}")
         
-        # Reward the referrer if valid
+        # Reward the referrer if valid and not banned
         if ref_id and ref_id != user_id:
             referrer = db.users.find_one({"user_id": ref_id})
-            if referrer:
+            if referrer and not referrer.get('banned', False):
                 db.users.update_one({"user_id": ref_id}, {"$inc": {"credits": 2, "total_referred": 1}})
                 # Notify referrer
                 try:
@@ -1314,6 +1394,14 @@ async def mobile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+        
+    num = context.args[0].strip()
+    if not num.isdigit() or len(num) != 10:
+        await update.message.reply_text(
+            format_error("Invalid Input", "Please enter a valid 10-digit mobile number"),
+            parse_mode='HTML'
+        )
+        return
     
     user = update.effective_user
     allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
@@ -1322,7 +1410,7 @@ async def mobile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     msg = await update.message.reply_text("🔍 <b>Searching...</b>", parse_mode='HTML')
-    result = await search_mobile_info(context.args[0], masked=masked)
+    result = await search_mobile_info(num, masked=masked)
     
     if masked:
         result = append_lock_message(result)
@@ -1338,6 +1426,14 @@ async def vehicle1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+        
+    rc = context.args[0].strip().upper()
+    if len(rc) < 8:
+        await update.message.reply_text(
+            format_error("Invalid Input", "Vehicle number must be at least 8 characters"),
+            parse_mode='HTML'
+        )
+        return
     
     user = update.effective_user
     allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
@@ -1346,7 +1442,7 @@ async def vehicle1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     msg = await update.message.reply_text("🔍 <b>Searching API 1...</b>", parse_mode='HTML')
-    result = await search_vehicle_info(context.args[0].upper(), 1, masked=masked)
+    result = await search_vehicle_info(rc, 1, masked=masked)
     
     if masked:
         result = append_lock_message(result)
@@ -1362,6 +1458,14 @@ async def vehicle2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+        
+    rc = context.args[0].strip().upper()
+    if len(rc) < 8:
+        await update.message.reply_text(
+            format_error("Invalid Input", "Vehicle number must be at least 8 characters"),
+            parse_mode='HTML'
+        )
+        return
     
     user = update.effective_user
     allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
@@ -1370,7 +1474,7 @@ async def vehicle2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     msg = await update.message.reply_text("🔍 <b>Searching API 2...</b>", parse_mode='HTML')
-    result = await search_vehicle_info(context.args[0].upper(), 2, masked=masked)
+    result = await search_vehicle_info(rc, 2, masked=masked)
     
     if masked:
         result = append_lock_message(result)
@@ -1386,6 +1490,14 @@ async def pan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+        
+    pan = context.args[0].strip().upper()
+    if not re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', pan):
+        await update.message.reply_text(
+            format_error("Invalid Input", "Format should be: ABCDE1234F"),
+            parse_mode='HTML'
+        )
+        return
     
     user = update.effective_user
     allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
@@ -1394,7 +1506,7 @@ async def pan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     msg = await update.message.reply_text("🔍 <b>Searching...</b>", parse_mode='HTML')
-    result = await search_pan_info(context.args[0].upper(), masked=masked)
+    result = await search_pan_info(pan, masked=masked)
     
     if masked:
         result = append_lock_message(result)
@@ -1410,6 +1522,14 @@ async def github_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+        
+    username = context.args[0].strip()
+    if not username or ' ' in username:
+        await update.message.reply_text(
+            format_error("Invalid Input", "Please enter a valid GitHub username"),
+            parse_mode='HTML'
+        )
+        return
     
     user = update.effective_user
     allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
@@ -1418,7 +1538,7 @@ async def github_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     msg = await update.message.reply_text("🔍 <b>Searching...</b>", parse_mode='HTML')
-    result = await search_github_info(context.args[0], masked=masked)
+    result = await search_github_info(username, masked=masked)
     
     if masked:
         result = append_lock_message(result)
@@ -1441,7 +1561,14 @@ async def leak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
         
-    query = ' '.join(context.args)
+    query = ' '.join(context.args).strip()
+    if not query:
+        await update.message.reply_text(
+            format_error("Invalid Input", "Please enter phone or email"),
+            parse_mode='HTML'
+        )
+        return
+        
     msg = await update.message.reply_text("🔍 <b>Searching leak database...</b>", parse_mode='HTML')
     results = await search_leak_info(query)
     
@@ -1472,6 +1599,14 @@ async def ifsc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
         return
+        
+    ifsc = context.args[0].strip().upper()
+    if len(ifsc) != 11:
+        await update.message.reply_text(
+            format_error("Invalid Input", "IFSC code must be exactly 11 characters\nExample: SBIN0001234"),
+            parse_mode='HTML'
+        )
+        return
     
     user = update.effective_user
     allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
@@ -1480,7 +1615,7 @@ async def ifsc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     msg = await update.message.reply_text("🔍 <b>Searching bank details...</b>", parse_mode='HTML')
-    result = await search_ifsc_info(context.args[0].upper(), masked=masked)
+    result = await search_ifsc_info(ifsc, masked=masked)
     
     if masked:
         result = append_lock_message(result)
@@ -1493,9 +1628,16 @@ async def ifsc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button presses"""
     query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # Check if banned (admins bypass)
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
+        await query.answer("❌ Your account has been banned by the Administrator.", show_alert=True)
+        return ConversationHandler.END
+        
     await query.answer()
     option = query.data
-    user_id = update.effective_user.id
     
     if option.startswith('leak_page:'):
         page_index = int(option.split(':')[1])
@@ -1513,6 +1655,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
         
     elif option == 'menu_search':
+        # Check Force Join
+        joined = await check_force_join(user_id, context.bot)
+        if not joined:
+            await query.edit_message_text(
+                FORCE_JOIN_TEXT,
+                reply_markup=get_force_join_keyboard(),
+                parse_mode='HTML',
+                disable_web_page_preview=True
+            )
+            return ConversationHandler.END
+            
         keyboard = [
             [InlineKeyboardButton("📱 Mobile Search", callback_data='mobile'),
              InlineKeyboardButton("🕵️ Leak OSINT", callback_data='leak')],
@@ -1537,6 +1690,39 @@ Select one of the query types below or use the quick commands to start searching
 • 🏦 IFSC: <code>/ifsc SBIN0001234</code>
 ━━━━━━━━━━━━━━━━━━━━"""
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return ConversationHandler.END
+
+    elif option == 'verify_force_join':
+        joined = await check_force_join(user_id, context.bot)
+        if joined:
+            await query.answer("✅ Verification Successful! Access Granted.", show_alert=True)
+            # Show the Search DB Panel (menu_search)
+            keyboard = [
+                [InlineKeyboardButton("📱 Mobile Search", callback_data='mobile'),
+                 InlineKeyboardButton("🕵️ Leak OSINT", callback_data='leak')],
+                [InlineKeyboardButton("🚗 Vehicle API 1", callback_data='vehicle1'),
+                 InlineKeyboardButton("🚙 Vehicle API 2", callback_data='vehicle2')],
+                [InlineKeyboardButton("📄 PAN Card", callback_data='pan'),
+                 InlineKeyboardButton("🏦 IFSC Details", callback_data='ifsc')],
+                [InlineKeyboardButton("💻 GitHub Lookup", callback_data='github')],
+                [InlineKeyboardButton("🔙 Back to Home", callback_data='start')]
+            ]
+            text = """🔎 <b>OSINT SEARCH PANEL</b>
+━━━━━━━━━━━━━━━━━━━━
+Select one of the query types below or use the quick commands to start searching immediately.
+
+📖 <b>Quick Search Commands:</b>
+• 📱 Mobile: <code>/mobile 9876543210</code>
+• 🚗 Vehicle 1: <code>/vehicle1 DL3CAS1234</code>
+• 🚙 Vehicle 2: <code>/vehicle2 DL3CAS1234</code>
+• 📄 PAN: <code>/pan ABCDE1234F</code>
+• 💻 GitHub: <code>/github username</code>
+• 🕵️ Leak: <code>/leak email_or_phone</code>
+• 🏦 IFSC: <code>/ifsc SBIN0001234</code>
+━━━━━━━━━━━━━━━━━━━━"""
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        else:
+            await query.answer("❌ Verification Failed: You must join both the group and channel first!", show_alert=True)
         return ConversationHandler.END
 
     elif option == 'menu_rewards':
@@ -1745,11 +1931,14 @@ If you face any issues, submit a support ticket using:
         user = update.effective_user
         user_id = user.id
         user_data = db.users.find_one({"user_id": user_id})
-        if user_data and user_data.get('banned', False):
+        if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
             await query.answer("Blocked", show_alert=True)
             return ConversationHandler.END
             
-        last_checkin = user_data.get('last_checkin') if user_data else None
+        if not user_data:
+            user_data = register_user(user)
+            
+        last_checkin = user_data.get('last_checkin')
         now = datetime.utcnow()
         if last_checkin:
             if last_checkin.tzinfo is not None:
@@ -2041,7 +2230,7 @@ async def checkin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_data:
         user_data = register_user(user)
         
-    if user_data.get('banned', False):
+    if user_data.get('banned', False) and user_id not in ADMIN_IDS:
         return
         
     last_checkin = user_data.get('last_checkin')
@@ -2077,7 +2266,7 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     
     user_data = db.users.find_one({"user_id": user_id})
-    if user_data and user_data.get('banned', False):
+    if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
         return
         
     top_users = db.users.find({}).sort("total_referred", -1).limit(10)
@@ -2112,8 +2301,11 @@ async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     
     user_data = db.users.find_one({"user_id": user_id})
-    if user_data and user_data.get('banned', False):
+    if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
         return
+        
+    if not user_data:
+        user_data = register_user(user)
         
     if not context.args:
         await update.message.reply_text(
@@ -2221,8 +2413,11 @@ async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     
     user_data = db.users.find_one({"user_id": user_id})
-    if user_data and user_data.get('banned', False):
+    if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
         return
+        
+    if not user_data:
+        user_data = register_user(user)
         
     if not context.args:
         await update.message.reply_text(
@@ -2324,7 +2519,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User Help command"""
     user_id = update.effective_user.id
     user_data = db.users.find_one({"user_id": user_id})
-    if user_data and user_data.get('banned', False):
+    if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
         return
         
     help_text = """📖 <b>DETAILDROP BOT USER GUIDE</b>
@@ -2485,47 +2680,47 @@ def main():
     
     # Conversation handler for button flow
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler)],
+        entry_points=[CallbackQueryHandler(private_chat_only(button_handler))],
         states={
-            WAITING_MOBILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mobile), CallbackQueryHandler(button_handler)],
-            WAITING_VEHICLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vehicle), CallbackQueryHandler(button_handler)],
-            WAITING_PAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pan), CallbackQueryHandler(button_handler)],
-            WAITING_GITHUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_github), CallbackQueryHandler(button_handler)],
-            WAITING_LEAK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_leak), CallbackQueryHandler(button_handler)],
-            WAITING_IFSC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ifsc), CallbackQueryHandler(button_handler)],
+            WAITING_MOBILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_mobile)), CallbackQueryHandler(private_chat_only(button_handler))],
+            WAITING_VEHICLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_vehicle)), CallbackQueryHandler(private_chat_only(button_handler))],
+            WAITING_PAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_pan)), CallbackQueryHandler(private_chat_only(button_handler))],
+            WAITING_GITHUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_github)), CallbackQueryHandler(private_chat_only(button_handler))],
+            WAITING_LEAK: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_leak)), CallbackQueryHandler(private_chat_only(button_handler))],
+            WAITING_IFSC: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_ifsc)), CallbackQueryHandler(private_chat_only(button_handler))],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler('cancel', private_chat_only(cancel))],
     )
     
     # Add all handlers
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('profile', show_profile))
-    app.add_handler(CommandHandler('buy', show_buy_credits))
-    app.add_handler(CommandHandler('admin', admin_cmd))
-    app.add_handler(CommandHandler('addcredit', addcredit_cmd))
-    app.add_handler(CommandHandler('removecredit', removecredit_cmd))
-    app.add_handler(CommandHandler('addpass', addpass_cmd))
-    app.add_handler(CommandHandler('addpassdays', addpassdays_cmd))
-    app.add_handler(CommandHandler('userinfo', userinfo_cmd))
-    app.add_handler(CommandHandler('broadcast', broadcast_cmd))
-    app.add_handler(CommandHandler('mobile', mobile_cmd))
-    app.add_handler(CommandHandler('vehicle1', vehicle1_cmd))
-    app.add_handler(CommandHandler('vehicle2', vehicle2_cmd))
-    app.add_handler(CommandHandler('vehicle', vehicle1_cmd))  # Alias
-    app.add_handler(CommandHandler('pan', pan_cmd))
-    app.add_handler(CommandHandler('github', github_cmd))
-    app.add_handler(CommandHandler('leak', leak_cmd))
-    app.add_handler(CommandHandler('ifsc', ifsc_cmd))
-    app.add_handler(CommandHandler('checkin', checkin_cmd))
-    app.add_handler(CommandHandler('leaderboard', leaderboard_cmd))
-    app.add_handler(CommandHandler('support', support_cmd))
-    app.add_handler(CommandHandler('reply', reply_cmd))
-    app.add_handler(CommandHandler('genpromo', genpromo_cmd))
-    app.add_handler(CommandHandler('claim', claim_cmd))
-    app.add_handler(CommandHandler('ban', ban_cmd))
-    app.add_handler(CommandHandler('unban', unban_cmd))
-    app.add_handler(CommandHandler('help', help_cmd))
-    app.add_handler(CommandHandler('adminhelp', adminhelp_cmd))
+    app.add_handler(CommandHandler('start', private_chat_only(start)))
+    app.add_handler(CommandHandler('profile', private_chat_only(show_profile)))
+    app.add_handler(CommandHandler('buy', private_chat_only(show_buy_credits)))
+    app.add_handler(CommandHandler('admin', private_chat_only(admin_cmd)))
+    app.add_handler(CommandHandler('addcredit', private_chat_only(addcredit_cmd)))
+    app.add_handler(CommandHandler('removecredit', private_chat_only(removecredit_cmd)))
+    app.add_handler(CommandHandler('addpass', private_chat_only(addpass_cmd)))
+    app.add_handler(CommandHandler('addpassdays', private_chat_only(addpassdays_cmd)))
+    app.add_handler(CommandHandler('userinfo', private_chat_only(userinfo_cmd)))
+    app.add_handler(CommandHandler('broadcast', private_chat_only(broadcast_cmd)))
+    app.add_handler(CommandHandler('mobile', private_chat_only(mobile_cmd)))
+    app.add_handler(CommandHandler('vehicle1', private_chat_only(vehicle1_cmd)))
+    app.add_handler(CommandHandler('vehicle2', private_chat_only(vehicle2_cmd)))
+    app.add_handler(CommandHandler('vehicle', private_chat_only(vehicle1_cmd)))  # Alias
+    app.add_handler(CommandHandler('pan', private_chat_only(pan_cmd)))
+    app.add_handler(CommandHandler('github', private_chat_only(github_cmd)))
+    app.add_handler(CommandHandler('leak', private_chat_only(leak_cmd)))
+    app.add_handler(CommandHandler('ifsc', private_chat_only(ifsc_cmd)))
+    app.add_handler(CommandHandler('checkin', private_chat_only(checkin_cmd)))
+    app.add_handler(CommandHandler('leaderboard', private_chat_only(leaderboard_cmd)))
+    app.add_handler(CommandHandler('support', private_chat_only(support_cmd)))
+    app.add_handler(CommandHandler('reply', private_chat_only(reply_cmd)))
+    app.add_handler(CommandHandler('genpromo', private_chat_only(genpromo_cmd)))
+    app.add_handler(CommandHandler('claim', private_chat_only(claim_cmd)))
+    app.add_handler(CommandHandler('ban', private_chat_only(ban_cmd)))
+    app.add_handler(CommandHandler('unban', private_chat_only(unban_cmd)))
+    app.add_handler(CommandHandler('help', private_chat_only(help_cmd)))
+    app.add_handler(CommandHandler('adminhelp', private_chat_only(adminhelp_cmd)))
     app.add_handler(conv_handler)
     
     print("[INFO] Bot is running!")
