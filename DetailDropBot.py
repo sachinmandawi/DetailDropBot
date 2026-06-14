@@ -16,6 +16,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
+import dns.resolver
+resolver = dns.resolver.Resolver(configure=False)
+resolver.nameservers = ['2001:4860:4860::8888', '2001:4860:4860::8844', '8.8.8.8', '8.8.4.4']
+dns.resolver.default_resolver = resolver
 import pymongo
 
 # ==================== CONFIGURATION ====================
@@ -428,7 +432,19 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     query = update.callback_query
     if query:
-        await query.edit_message_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        from telegram.error import BadRequest
+        try:
+            await query.edit_message_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            await query.answer("✅ Stats Refreshed Successfully!", show_alert=False)
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                await query.answer("Stats are already up to date!", show_alert=False)
+            else:
+                try:
+                    await query.answer()
+                except Exception:
+                    pass
+                raise e
     else:
         await update.effective_message.reply_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
