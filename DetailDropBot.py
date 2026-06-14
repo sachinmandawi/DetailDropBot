@@ -381,7 +381,8 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ADMIN_IDS:
         query = update.callback_query
         if query:
-            await query.answer("Unauthorized", show_alert=True)
+            await query.answer()
+            await send_temp_message(context, user_id, "❌ <b>Unauthorized:</b> This command is only for admins.")
         else:
             await update.effective_message.reply_text("❌ <b>Unauthorized:</b> This command is only for admins.", parse_mode='HTML')
         return
@@ -435,10 +436,12 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from telegram.error import BadRequest
         try:
             await query.edit_message_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-            await query.answer("✅ Stats Refreshed Successfully!", show_alert=False)
+            await query.answer()
+            await send_temp_message(context, user_id, "✅ <b>Stats Refreshed Successfully!</b>")
         except BadRequest as e:
             if "Message is not modified" in str(e):
-                await query.answer("Stats are already up to date!", show_alert=False)
+                await query.answer()
+                await send_temp_message(context, user_id, "ℹ️ <b>Stats are already up to date!</b>")
             else:
                 try:
                     await query.answer()
@@ -744,6 +747,31 @@ def handle_api_exception(name: str, e: Exception) -> str:
     elif isinstance(e, (json.JSONDecodeError, ValueError)):
         return format_error(f"{name} Error", "Received an invalid response format from the database server.")
     return format_error(f"{name} Error", str(e))
+
+async def send_temp_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode: str = 'HTML', delay: int = 15, reply_markup=None):
+    """Sends a message and schedules it to be deleted after `delay` seconds"""
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup
+        )
+        # Schedule the deletion task to run in the background
+        asyncio.create_task(delete_message_after_delay(context, chat_id, msg.message_id, delay))
+        return msg
+    except Exception as e:
+        logger.error(f"Error sending temporary message: {e}")
+        return None
+
+async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
+    """Delays for `delay` seconds, then deletes the specified message"""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        # Ignore errors if the message was already deleted by the user
+        pass
 
 def format_no_results(query):
     """Format no results message"""
@@ -1668,7 +1696,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if banned (admins bypass)
     user_data = db.users.find_one({"user_id": user_id})
     if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
-        await query.answer("❌ Your account has been banned by the Administrator.", show_alert=True)
+        await query.answer()
+        await send_temp_message(context, user_id, "❌ <b>Your account has been banned by the Administrator.</b>")
         return ConversationHandler.END
         
     # Pre-check search query options for bans, maintenance, and force join
@@ -1685,9 +1714,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True
                 )
             else:
-                # Banned or Maintenance: show popup modal alert (stripping HTML tags)
-                clean_msg = re.sub(r'<[^>]*>', '', err_msg)
-                await query.answer(clean_msg, show_alert=True)
+                # Banned or Maintenance: show temporary HTML message
+                await query.answer()
+                await send_temp_message(context, user_id, err_msg)
             return ConversationHandler.END
 
     await query.answer()
@@ -1748,7 +1777,8 @@ Select one of the query types below or use the quick commands to start searching
     elif option == 'verify_force_join':
         joined, missing = await check_force_join_status(user_id, context.bot)
         if joined:
-            await query.answer("✅ Verification Successful! Access Granted.", show_alert=True)
+            await query.answer()
+            await send_temp_message(context, user_id, "✅ <b>Verification Successful! Access Granted.</b>")
             # Show the Search DB Panel (menu_search)
             keyboard = [
                 [InlineKeyboardButton("📱 Mobile Search", callback_data='mobile'),
@@ -1776,12 +1806,13 @@ Select one of the query types below or use the quick commands to start searching
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         else:
             if missing == "both":
-                msg = "❌ Verification Failed: You must join both our Public Group and Channel first!"
+                msg = "❌ <b>Verification Failed:</b> You must join both our Public Group and Channel first!"
             elif missing == "group":
-                msg = "❌ Verification Failed: You haven't joined our Public Group yet!"
+                msg = "❌ <b>Verification Failed:</b> You haven't joined our Public Group yet!"
             else:
-                msg = "❌ Verification Failed: You haven't joined our Public Channel yet!"
-            await query.answer(msg, show_alert=True)
+                msg = "❌ <b>Verification Failed:</b> You haven't joined our Public Channel yet!"
+            await query.answer()
+            await send_temp_message(context, user_id, msg)
         return ConversationHandler.END
 
     elif option == 'menu_rewards':
@@ -1991,7 +2022,8 @@ If you face any issues, submit a support ticket using:
         user_id = user.id
         user_data = db.users.find_one({"user_id": user_id})
         if user_data and user_data.get('banned', False) and user_id not in ADMIN_IDS:
-            await query.answer("Blocked", show_alert=True)
+            await query.answer()
+            await send_temp_message(context, user_id, "🚫 <b>Access Denied:</b> Your account has been blocked.")
             return ConversationHandler.END
             
         if not user_data:
@@ -2007,7 +2039,8 @@ If you face any issues, submit a support ticket using:
                 time_left = 86400 - elapsed.total_seconds()
                 hours = int(time_left // 3600)
                 minutes = int((time_left % 3600) // 60)
-                await query.answer(f"⏳ Already claimed! Try again in {hours}h {minutes}m", show_alert=True)
+                await query.answer()
+                await send_temp_message(context, user_id, f"⏳ <b>Already Claimed:</b> Please try again in <b>{hours}h {minutes}m</b>.")
                 return ConversationHandler.END
                 
         # Reward
@@ -2015,7 +2048,8 @@ If you face any issues, submit a support ticket using:
             {"user_id": user_id},
             {"$inc": {"credits": 1}, "$set": {"last_checkin": now}}
         )
-        await query.answer("🎁 Daily Check-in Successful! +1 Credit added.", show_alert=True)
+        await query.answer()
+        await send_temp_message(context, user_id, "🎁 <b>Daily Check-in Successful!</b> +1 Credit has been added to your profile.")
         await show_profile(update, context)
         return ConversationHandler.END
         
@@ -2024,23 +2058,32 @@ If you face any issues, submit a support ticket using:
         return ConversationHandler.END
         
     elif option == 'support_info':
-        await query.answer("📩 Submit support query using:\n/support <your message>", show_alert=True)
+        await query.answer()
+        await send_temp_message(
+            context,
+            user_id,
+            "📩 <b>Support Ticket:</b>\nSubmit your support query using the command:\n<code>/support &lt;your message&gt;</code>"
+        )
         return ConversationHandler.END
         
     elif option == 'admin_toggle_maint':
         if user_id not in ADMIN_IDS:
-            await query.answer("Unauthorized", show_alert=True)
+            await query.answer()
+            await send_temp_message(context, user_id, "⚠️ <b>Unauthorized:</b> You do not have permission to use this command.")
             return ConversationHandler.END
         settings_doc = db.settings.find_one({"_id": "global_settings"})
         is_maintenance = settings_doc.get('maintenance_mode', False) if settings_doc else False
         db.settings.update_one({"_id": "global_settings"}, {"$set": {"maintenance_mode": not is_maintenance}})
-        await query.answer(f"Maintenance mode {'disabled' if is_maintenance else 'enabled'}", show_alert=True)
+        await query.answer()
+        status_text = "<b>disabled</b> 🟢" if is_maintenance else "<b>enabled</b> 🔴"
+        await send_temp_message(context, user_id, f"⚙️ <b>Maintenance mode</b> has been {status_text}.")
         await show_admin_panel(update, context)
         return ConversationHandler.END
         
     elif option == 'admin_api_health' or option == 'admin_refresh_api':
         if user_id not in ADMIN_IDS:
-            await query.answer("Unauthorized", show_alert=True)
+            await query.answer()
+            await send_temp_message(context, user_id, "⚠️ <b>Unauthorized:</b> You do not have permission to use this command.")
             return ConversationHandler.END
         await query.edit_message_text("🔌 <b>Pinging all API endpoints...</b>\n<i>Please wait a few seconds.</i>", parse_mode='HTML')
         health_text = await check_api_health()
@@ -2057,7 +2100,8 @@ If you face any issues, submit a support ticket using:
 
     elif option == 'admin_broadcast':
         if user_id not in ADMIN_IDS:
-            await query.answer("Unauthorized", show_alert=True)
+            await query.answer()
+            await send_temp_message(context, user_id, "⚠️ <b>Unauthorized:</b> You do not have permission to use this command.")
             return ConversationHandler.END
         broadcast_instr = f"""📢 <b>Send Broadcast</b>
 ━━━━━━━━━━━━━━━━━━━━
