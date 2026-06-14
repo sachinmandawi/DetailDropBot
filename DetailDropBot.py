@@ -19,7 +19,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 import pymongo
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAFzsIOx2mWpxbXNdqlO7rr0n_BsxbTdYM4")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8439636405:AAHSflD05Q1Ss4h1NFhAM6zMeWszcgVha6s")
 
 # API URLs
 MOBILE_API = "https://numberto-info-noobster.com-dashbord63hh7qe4.workers.dev/?number={}"
@@ -54,6 +54,16 @@ try:
     mongo_client = pymongo.MongoClient(MONGO_URI)
     db = mongo_client["DetailDropBotDB"]
     db.users.create_index("user_id", unique=True)
+    db.promocodes.create_index("code", unique=True)
+    
+    # Initialize settings if not exists
+    settings_doc = db.settings.find_one({"_id": "global_settings"})
+    if not settings_doc:
+        db.settings.insert_one({
+            "_id": "global_settings",
+            "maintenance_mode": False,
+            "total_queries": 0
+        })
     logger.info("MongoDB connected successfully!")
 except Exception as e:
     logger.critical(f"Failed to connect to MongoDB: {e}")
@@ -65,31 +75,44 @@ def register_user(user, ref_id=None):
     user_data = db.users.find_one({"user_id": user_id})
     if not user_data:
         joined_at = datetime.utcnow()
+        pass_expiry = joined_at + timedelta(days=1) # 1-day free pass
         user_data = {
             "user_id": user_id,
             "first_name": user.first_name,
             "username": user.username,
             "joined_at": joined_at,
-            "credits": 0,
+            "pass_expiry": pass_expiry,
+            "credits": 10,
             "referred_by": ref_id,
-            "total_referred": 0
+            "total_referred": 0,
+            "banned": False,
+            "last_checkin": None,
+            "queries_count": 0
         }
         db.users.insert_one(user_data)
         logger.info(f"Registered new user: {user_id} (Referrer: {ref_id})")
     return user_data
 
-def get_free_pass_time_left(user_data):
-    """Get remaining seconds for user's 1-hour free pass"""
+def get_pass_time_left(user_data):
+    """Get remaining seconds for user's time-based pass"""
     if not user_data:
         return 0
-    joined_at = user_data.get('joined_at')
-    if not joined_at:
-        return 0
-    if joined_at.tzinfo is not None:
-        joined_at = joined_at.astimezone(timezone.utc).replace(tzinfo=None)
-    elapsed = datetime.utcnow() - joined_at
-    time_left = 3600 - elapsed.total_seconds()
-    return max(0, int(time_left))
+    pass_expiry = user_data.get('pass_expiry')
+    if not pass_expiry:
+        # Fallback to calculating from joined_at for legacy users
+        joined_at = user_data.get('joined_at')
+        if not joined_at:
+            return 0
+        if joined_at.tzinfo is not None:
+            joined_at = joined_at.astimezone(timezone.utc).replace(tzinfo=None)
+        elapsed = datetime.utcnow() - joined_at
+        time_left = 3600 - elapsed.total_seconds()
+        return max(0, int(time_left))
+        
+    if pass_expiry.tzinfo is not None:
+        pass_expiry = pass_expiry.astimezone(timezone.utc).replace(tzinfo=None)
+    time_left = pass_expiry - datetime.utcnow()
+    return max(0, int(time_left.total_seconds()))
 
 def has_user_access_only(user_id):
     """Check if user has active pass or >= 1 credit without deducting it"""
@@ -98,22 +121,43 @@ def has_user_access_only(user_id):
     user_data = db.users.find_one({"user_id": user_id})
     if not user_data:
         return True # Will register on query
-    time_left = get_free_pass_time_left(user_data)
+    if user_data.get('banned', False):
+        return False
+    time_left = get_pass_time_left(user_data)
     if time_left > 0:
         return True
     return user_data.get('credits', 0) >= 1
 
 async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, bool, str, InlineKeyboardMarkup]:
-    """Check if the user has an active free pass or has credit, deducting a credit if pass expired. Returns (allowed, masked, error_msg, reply_markup)"""
+    """Check if the user has an active free pass or has credit, checking ban and maintenance status first. Returns (allowed, masked, error_msg, reply_markup)"""
     user_id = user.id
+    
+    # 1. Ban Check
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False):
+        return False, False, "❌ <b>Your account has been banned by the Administrator.</b>", None
+        
+    # 2. Maintenance Mode Check
+    settings_doc = db.settings.find_one({"_id": "global_settings"})
+    is_maintenance = settings_doc.get('maintenance_mode', False) if settings_doc else False
+    if is_maintenance and user_id not in ADMIN_IDS:
+        return False, False, "🔧 <b>Maintenance Mode Active:</b> The bot is temporarily undergoing scheduled updates. Please try again later.", None
+        
+    # Admin has absolute access
     if user_id in ADMIN_IDS:
+        db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
+        if user_data:
+            db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
         return True, False, "", None
         
-    user_data = db.users.find_one({"user_id": user_id})
     if not user_data:
         user_data = register_user(user)
         
-    time_left = get_free_pass_time_left(user_data)
+    # Increment queries count for successful attempt
+    db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
+    db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
+        
+    time_left = get_pass_time_left(user_data)
     if time_left > 0:
         return True, False, "", None
         
@@ -147,17 +191,18 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💡 <i>You have system bypass and infinite credits enabled. Use the Admin Panel button below to manage users and view statistics.</i>"""
         keyboard = [
             [InlineKeyboardButton("📊 Admin Panel", callback_data="admin_panel")],
-            [InlineKeyboardButton("🔙 Back to Start", callback_data="start")]
+            [InlineKeyboardButton("🔙 Back to Home", callback_data="start")]
         ]
     else:
         credits = user_data.get('credits', 0)
-        time_left = get_free_pass_time_left(user_data)
+        time_left = get_pass_time_left(user_data)
         if time_left > 0:
-            mins = time_left // 60
-            secs = time_left % 60
-            status_str = f"Active ✅ ({mins}m {secs}s left)"
+            if time_left >= 86400:
+                status_str = f"Active ✅ ({time_left // 86400}d {(time_left % 86400) // 3600}h left)"
+            else:
+                status_str = f"Active ✅ ({time_left // 3600}h {(time_left % 3600) // 60}m left)"
         else:
-            status_str = "Expired ❌"
+            status_str = "Expired / Inactive ❌"
             
         bot_username = context.bot.username
         ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
@@ -168,10 +213,10 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔑 <b>Username:</b> @{escape_html(user.username) if user.username else 'N/A'}
 🆔 <b>User ID:</b> <code>{user_id}</code>
 
-💰 <b>CREDIT INFO</b>
+💰 <b>ACCOUNT STATUS</b>
 ━━━━━━━━━━━━━━━━━━━━
 💵 <b>Credit Balance:</b> <code>{credits} credits</code>
-⏳ <b>Free Pass Status:</b> {status_str}
+⏳ <b>Time Pass Status:</b> {status_str}
  
 👥 <b>REFERRAL SYSTEM</b>
 ━━━━━━━━━━━━━━━━━━━━
@@ -185,7 +230,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💡 <i>Share your invite link above. You will instantly earn <b>+2 credits</b> for every friend who joins!</i>"""
         keyboard = [
             [InlineKeyboardButton("💳 Buy Credits", callback_data="buy_credits")],
-            [InlineKeyboardButton("🔙 Back to Start", callback_data="start")]
+            [InlineKeyboardButton("🔙 Back to Home", callback_data="start")]
         ]
     
     query = update.callback_query
@@ -203,28 +248,32 @@ async def show_buy_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⚠️ You are an administrator and have <b>infinite credits</b>.
 
 🛠️ <b>Credit Management:</b>
-To add or remove credits for a user, use:
 • Add credits: <code>/addcredit &lt;user_id&gt; &lt;amount&gt;</code>
 • Remove credits: <code>/removecredit &lt;user_id&gt; &lt;amount&gt;</code>
+
+⚡ <b>Time Pass Management:</b>
+• Add Pass (Hours): <code>/addpass &lt;user_id&gt; &lt;hours&gt;</code>
+• Add Pass (Days): <code>/addpassdays &lt;user_id&gt; &lt;days&gt;</code>
 ━━━━━━━━━━━━━━━━━━━━"""
         keyboard = [
             [InlineKeyboardButton("📊 Admin Panel", callback_data="admin_panel")],
-            [InlineKeyboardButton("🔙 Back to Start", callback_data="start")]
+            [InlineKeyboardButton("🔙 Back to Home", callback_data="start")]
         ]
     else:
-        text_template = f"Hi! I want to buy credits for DetailDropBot. My User ID is {user_id}"
+        text_template = f"Hi! I want to buy a Time Pass for DetailDropBot. My User ID is {user_id}"
         import urllib.parse
         encoded_text = urllib.parse.quote(text_template)
         admin_link = f"https://t.me/{ADMIN_USERNAME}?text={encoded_text}"
         
-        buy_text = f"""💳 <b>BUY CREDITS</b>
+        buy_text = f"""💳 <b>BUY TIME PASSES</b>
 ━━━━━━━━━━━━━━━━━━━━
-Get credits to continue searching bank, vehicle, mobile, pan, leak, and github details immediately.
+Get a Time Pass to continue searching bank, vehicle, mobile, pan, leak, and github details with **unlimited queries**!
 
 🏷️ <b>Pricing Packages:</b>
-• <b>Starter Pack:</b> 10 Credits - ₹50
-• <b>Pro Pack:</b> 50 Credits - ₹200
-• <b>VIP Pack:</b> 100 Credits - ₹350
+• ⚡ <b>Flash Pass (1 Hour):</b> ₹15
+• 📅 <b>Day Pass (24 Hours):</b> ₹29
+• 🛡️ <b>Weekly Pass (7 Days):</b> ₹79
+• 👑 <b>VIP Month Pass (30 Days):</b> ₹199
 
 🛒 <b>How to Buy:</b>
 Click the button below to message the admin (<b>@{ADMIN_USERNAME}</b>) directly. You will be redirected with your User ID pre-filled.
@@ -232,7 +281,7 @@ Click the button below to message the admin (<b>@{ADMIN_USERNAME}</b>) directly.
         keyboard = [
             [InlineKeyboardButton("💬 Message Admin to Buy", url=admin_link)],
             [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
-            [InlineKeyboardButton("🔙 Back to Start", callback_data="start")]
+            [InlineKeyboardButton("🔙 Back to Home", callback_data="start")]
         ]
         
     query = update.callback_query
@@ -256,21 +305,41 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_passes = db.users.count_documents({"joined_at": {"$gte": one_hour_ago}})
     referrals_count = db.users.count_documents({"total_referred": {"$gt": 0}})
     
+    settings_doc = db.settings.find_one({"_id": "global_settings"})
+    if not settings_doc:
+        settings_doc = {
+            "maintenance_mode": False,
+            "total_queries": 0
+        }
+    is_maintenance = settings_doc.get('maintenance_mode', False)
+    total_queries = settings_doc.get('total_queries', 0)
+    
+    maintenance_status = "🟢 <b>INACTIVE</b>" if not is_maintenance else "🔴 <b>ACTIVE (Admins Only)</b>"
+    
     admin_text = f"""📊 <b>ADMIN PANEL</b>
 ━━━━━━━━━━━━━━━━━━━━
 👥 <b>Total Users:</b> <code>{total_users}</code>
 ⏳ <b>Active Free Passes:</b> <code>{active_passes}</code>
 👥 <b>Active Referrers:</b> <code>{referrals_count}</code>
+🔍 <b>Total Queries Run:</b> <code>{total_queries}</code>
+🔧 <b>Maintenance Mode:</b> {maintenance_status}
 
 📝 <b>Quick Commands:</b>
 • Add credits: <code>/addcredit &lt;user_id&gt; &lt;amount&gt;</code>
 • Remove credits: <code>/removecredit &lt;user_id&gt; &lt;amount&gt;</code>
 • User info: <code>/userinfo &lt;user_id&gt;</code>
-• Broadcast: <code>/broadcast &lt;message&gt;</code>
+• Ban User: <code>/ban &lt;user_id&gt;</code>
+• Unban User: <code>/unban &lt;user_id&gt;</code>
+• Gen Promo Code: <code>/genpromo &lt;code&gt; &lt;credits&gt; &lt;max_uses&gt;</code>
+• Support Reply: <code>/reply &lt;user_id&gt; &lt;message&gt;</code>
 ━━━━━━━━━━━━━━━━━━━━"""
+    
+    maint_btn_text = "🔧 Enable Maintenance" if not is_maintenance else "🔧 Disable Maintenance"
     
     keyboard = [
         [InlineKeyboardButton("📊 Refresh Stats", callback_data="admin_refresh")],
+        [InlineKeyboardButton("🔌 API Health Manager", callback_data="admin_api_health")],
+        [InlineKeyboardButton(maint_btn_text, callback_data="admin_toggle_maint")],
         [InlineKeyboardButton("📢 Send Broadcast", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🔙 Back to Start", callback_data="start")]
     ]
@@ -349,47 +418,172 @@ async def userinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ User not found in database.", parse_mode='HTML')
         return
         
-    time_left = get_free_pass_time_left(target)
-    status_str = f"Active ({time_left // 60}m left)" if time_left > 0 else "Expired"
-    
+    time_left = get_pass_time_left(target)
+    if time_left > 0:
+        if time_left >= 86400:
+            status_str = f"Active ({time_left // 86400}d {(time_left % 86400) // 3600}h left)"
+        else:
+            status_str = f"Active ({time_left // 3600}h {(time_left % 3600) // 60}m left)"
+    else:
+        status_str = "Expired"
+        
     info_text = f"""👤 <b>USER DETAILS</b>
 ━━━━━━━━━━━━━━━━━━━━
 🆔 <b>User ID:</b> <code>{target['user_id']}</code>
 👤 <b>First Name:</b> {escape_html(target.get('first_name'))}
 🔑 <b>Username:</b> @{escape_html(target.get('username')) if target.get('username') else 'N/A'}
-⏳ <b>Free Pass:</b> {status_str}
+⏳ <b>Time Pass:</b> {status_str}
 💰 <b>Credits:</b> <code>{target.get('credits', 0)}</code>
 👥 <b>Total Referred:</b> <code>{target.get('total_referred', 0)}</code>
 📅 <b>Joined Date:</b> {target.get('joined_at').strftime('%Y-%m-%d %H:%M:%S')} UTC
 ━━━━━━━━━━━━━━━━━━━━"""
     await update.message.reply_text(info_text, parse_mode='HTML')
 
+async def addpass_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addpass <user_id> <hours>", parse_mode='HTML')
+        return
+    try:
+        target_id = int(context.args[0])
+        hours = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Error: User ID and Hours must be integers.", parse_mode='HTML')
+        return
+        
+    target = db.users.find_one({"user_id": target_id})
+    if not target:
+        await update.message.reply_text("❌ User not found in database.", parse_mode='HTML')
+        return
+        
+    now = datetime.utcnow()
+    current_expiry = target.get('pass_expiry')
+    if current_expiry:
+        if current_expiry.tzinfo is not None:
+            current_expiry = current_expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        start_time = max(current_expiry, now)
+    else:
+        # Fallback using joined_at
+        joined_at = target.get('joined_at')
+        if joined_at:
+            if joined_at.tzinfo is not None:
+                joined_at = joined_at.astimezone(timezone.utc).replace(tzinfo=None)
+            legacy_left = 3600 - (now - joined_at).total_seconds()
+            if legacy_left > 0:
+                start_time = now + timedelta(seconds=legacy_left)
+            else:
+                start_time = now
+        else:
+            start_time = now
+            
+    new_expiry = start_time + timedelta(hours=hours)
+    db.users.update_one({"user_id": target_id}, {"$set": {"pass_expiry": new_expiry}})
+    
+    await update.message.reply_text(
+        f"✅ Successfully added <b>{hours} hours</b> of Time Pass to User ID <code>{target_id}</code>.\n"
+        f"📅 New Expiry: <code>{new_expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC</code>",
+        parse_mode='HTML'
+    )
+    
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎁 <b>Time Pass Added!</b>\n━━━━━━━━━━━━━━━━━━━━\nAdmin has added <b>{hours} hours</b> of unlimited OSINT search access to your account.\n⚡ Check /profile to view your pass status.",
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+async def addpassdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addpassdays <user_id> <days>", parse_mode='HTML')
+        return
+    try:
+        target_id = int(context.args[0])
+        days = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Error: User ID and Days must be integers.", parse_mode='HTML')
+        return
+        
+    target = db.users.find_one({"user_id": target_id})
+    if not target:
+        await update.message.reply_text("❌ User not found in database.", parse_mode='HTML')
+        return
+        
+    now = datetime.utcnow()
+    current_expiry = target.get('pass_expiry')
+    if current_expiry:
+        if current_expiry.tzinfo is not None:
+            current_expiry = current_expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        start_time = max(current_expiry, now)
+    else:
+        # Fallback using joined_at
+        joined_at = target.get('joined_at')
+        if joined_at:
+            if joined_at.tzinfo is not None:
+                joined_at = joined_at.astimezone(timezone.utc).replace(tzinfo=None)
+            legacy_left = 3600 - (now - joined_at).total_seconds()
+            if legacy_left > 0:
+                start_time = now + timedelta(seconds=legacy_left)
+            else:
+                start_time = now
+        else:
+            start_time = now
+            
+    new_expiry = start_time + timedelta(days=days)
+    db.users.update_one({"user_id": target_id}, {"$set": {"pass_expiry": new_expiry}})
+    
+    await update.message.reply_text(
+        f"✅ Successfully added <b>{days} days</b> of Time Pass to User ID <code>{target_id}</code>.\n"
+        f"📅 New Expiry: <code>{new_expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC</code>",
+        parse_mode='HTML'
+    )
+    
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎁 <b>Time Pass Added!</b>\n━━━━━━━━━━━━━━━━━━━━\nAdmin has added <b>{days} days</b> of unlimited OSINT search access to your account.\n⚡ Check /profile to view your pass status.",
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>", parse_mode='HTML')
+        
+    if not update.message.reply_to_message:
+        await update.message.reply_text(
+            "⚠️ <b>Reply Required:</b>\n"
+            "To send a broadcast, please <b>reply to the target message</b> (text, image, video, document, etc.) with <code>/broadcast</code>.",
+            parse_mode='HTML'
+        )
         return
         
-    message_text = " ".join(context.args)
-    users = db.users.find({})
+    target_msg = update.message.reply_to_message
+    users = list(db.users.find({}))
     success = 0
     fail = 0
     
-    msg = await update.message.reply_text("📢 <b>Sending broadcast...</b>", parse_mode='HTML')
+    status_msg = await update.message.reply_text("📢 <b>Sending broadcast...</b>", parse_mode='HTML')
     
     for u in users:
+        u_id = u['user_id']
         try:
-            await context.bot.send_message(
-                chat_id=u['user_id'],
-                text=f"📢 <b>ANNOUNCEMENT</b>\n━━━━━━━━━━━━━━━━━━━━\n{message_text}",
-                parse_mode='HTML'
-            )
+            # Copy the message exactly, including its original markup (buttons)
+            await target_msg.copy(chat_id=u_id, reply_markup=target_msg.reply_markup)
             success += 1
         except Exception:
             fail += 1
             
-    await msg.edit_text(f"📢 <b>Broadcast Completed!</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ <b>Success:</b> <code>{success}</code>\n❌ <b>Failed:</b> <code>{fail}</code>", parse_mode='HTML')
+    await status_msg.edit_text(
+        f"📢 <b>Broadcast Completed!</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ <b>Success:</b> <code>{success}</code>\n❌ <b>Failed:</b> <code>{fail}</code>",
+        parse_mode='HTML'
+    )
 
 # ==================== FORMATTING HELPERS ====================
 
@@ -497,8 +691,6 @@ def mask_val(val, is_phone=False):
             return "".join(chars)
         else:
             chars = list(val_str)
-            first_idx = alphas[0]
-            last_idx = alphas[-1]
             for idx in alphas[1:-1]:
                 chars[idx] = "█"
             return "".join(chars)
@@ -587,7 +779,10 @@ async def send_formatted_message(update: Update, text: str, msg_to_edit=None, re
 async def search_mobile_info(number: str, masked: bool = False) -> str:
     """Search mobile number information"""
     try:
-        response = requests.get(MOBILE_API.format(number), timeout=15)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.get(MOBILE_API.format(number), timeout=15)
+        )
         raw_text = response.text.strip()
         last_brace = raw_text.rfind('}')
         if last_brace != -1:
@@ -622,7 +817,10 @@ async def search_vehicle_info(rc: str, api_choice: int = 1, masked: bool = False
     """Search vehicle registration information"""
     try:
         if api_choice == 1:
-            response = requests.get(VEHICLE_API_1.format(rc), timeout=15)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, lambda: requests.get(VEHICLE_API_1.format(rc), timeout=15)
+            )
             data = response.json()
             
             if data.get('success') and data.get('vehicle_info'):
@@ -701,7 +899,10 @@ async def search_vehicle_info(rc: str, api_choice: int = 1, masked: bool = False
             return format_no_results(rc)
         
         else:
-            response = requests.get(VEHICLE_API_2.format(rc), timeout=25)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, lambda: requests.get(VEHICLE_API_2.format(rc), timeout=25)
+            )
             data = response.json()
             
             if data:
@@ -783,7 +984,10 @@ async def search_pan_info(pan: str, masked: bool = False) -> str:
     """Search PAN card information"""
     try:
         pointer = PAN_API.format(pan)
-        response = requests.get(pointer, timeout=15)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.get(pointer, timeout=15)
+        )
         data = response.json()
         
         if data.get('success') and data.get('pan_info'):
@@ -827,7 +1031,10 @@ async def search_pan_info(pan: str, masked: bool = False) -> str:
 async def search_github_info(username: str, masked: bool = False) -> str:
     """Search GitHub profile information"""
     try:
-        response = requests.get(GITHUB_API.format(username), timeout=15)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.get(GITHUB_API.format(username), timeout=15)
+        )
         if response.status_code == 404:
             return format_no_results(username)
         
@@ -859,7 +1066,10 @@ async def search_github_info(username: str, masked: bool = False) -> str:
 async def search_ifsc_info(ifsc: str, masked: bool = False) -> str:
     """Search bank information by IFSC code"""
     try:
-        response = requests.get(IFSC_API.format(ifsc), timeout=15)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.get(IFSC_API.format(ifsc), timeout=15)
+        )
         data = response.json()
         
         if isinstance(data, dict):
@@ -1006,7 +1216,10 @@ async def search_leak_info(query: str):
     """Search leak database for information and return raw results list or error string"""
     try:
         logger.info(f"Searching leak API for: {query}")
-        response = requests.get(LEAK_API.format(query), timeout=20)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: requests.get(LEAK_API.format(query), timeout=20)
+        )
         
         if response.status_code != 200:
             return f"Server returned status {response.status_code}"
@@ -1047,6 +1260,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # New user registration!
         user_data = register_user(user, ref_id)
         
+        # Send welcome gift notification to new user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🎉 <b>Welcome to DetailDrop!</b> You received <b>1-Day Free Pass</b> & <b>10 Credits</b> 🎁",
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Failed to send welcome gift notification to {user_id}: {e}")
+        
         # Reward the referrer if valid
         if ref_id and ref_id != user_id:
             referrer = db.users.find_one({"user_id": ref_id})
@@ -1062,46 +1285,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Failed to notify referrer: {e}")
 
-    if user_id in ADMIN_IDS:
-        bottom_row = [
-            InlineKeyboardButton("👤 Profile", callback_data='profile'),
-            InlineKeyboardButton("📊 Admin Panel", callback_data='admin_panel')
-        ]
-        welcome_greeting = f"Welcome 👑 <b>Admin {escape_html(user.first_name)}</b>!"
-    else:
-        bottom_row = [
-            InlineKeyboardButton("👤 Profile", callback_data='profile'),
-            InlineKeyboardButton("💳 Buy Credits", callback_data='buy_credits')
-        ]
-        welcome_greeting = f"Welcome {escape_html(user.first_name)}!"
-
     keyboard = [
-        [InlineKeyboardButton("📱 Mobile Search", callback_data='mobile')],
-        [InlineKeyboardButton("🚗 Vehicle API 1", callback_data='vehicle1'), 
-         InlineKeyboardButton("🚙 Vehicle API 2", callback_data='vehicle2')],
-        [InlineKeyboardButton("📄 PAN Card", callback_data='pan'),
-         InlineKeyboardButton("💻 GitHub", callback_data='github')],
-        [InlineKeyboardButton("🕵️ Leak OSINT", callback_data='leak'),
-         InlineKeyboardButton("🏦 IFSC Details", callback_data='ifsc')],
-        bottom_row
+        [InlineKeyboardButton("🔎 Search DB Panel", callback_data='menu_search')],
+        [InlineKeyboardButton("💰 Earn & Rewards", callback_data='menu_rewards')],
+        [InlineKeyboardButton("👤 My Account", callback_data='menu_account'),
+         InlineKeyboardButton("💳 Support & Buy", callback_data='menu_support')],
+        [InlineKeyboardButton("📖 Help Guide", callback_data='menu_help')]
     ]
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("📊 Admin Panel", callback_data='admin_panel')])
+        
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    welcome = f"""🔍 <b>DetailDrop Bot</b>
-━━━━━━━━━━━━━━━━━━━━
-{welcome_greeting}
-
-Tap one of the interactive options below to search immediately.
-━━━━━━━━━━━━━━━━━━━━
-📖 <b>Quick Command Guide:</b>
-• 📱 Mobile: <code>/mobile 9876543210</code>
-• 🚗 Vehicle 1: <code>/vehicle1 DL3CAS1234</code>
-• 🚙 Vehicle 2: <code>/vehicle2 DL3CAS1234</code>
-• 📄 PAN: <code>/pan ABCDE1234F</code>
-• 💻 GitHub: <code>/github username</code>
-• 🕵️ Leak: <code>/leak email_or_phone</code>
-• 🏦 IFSC: <code>/ifsc SBIN0001234</code>
-━━━━━━━━━━━━━━━━━━━━"""
+    welcome = "🕵️ <i>Cyber-intelligence at your fingertips. Select a category below to search.</i>"
     
     if update.message:
         await update.message.reply_text(welcome, reply_markup=reply_markup, parse_mode='HTML')
@@ -1316,12 +1512,147 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(format_error("Session Expired", "Please search again using /leak."), parse_mode='HTML')
         return ConversationHandler.END
         
+    elif option == 'menu_search':
+        keyboard = [
+            [InlineKeyboardButton("📱 Mobile Search", callback_data='mobile'),
+             InlineKeyboardButton("🕵️ Leak OSINT", callback_data='leak')],
+            [InlineKeyboardButton("🚗 Vehicle API 1", callback_data='vehicle1'),
+             InlineKeyboardButton("🚙 Vehicle API 2", callback_data='vehicle2')],
+            [InlineKeyboardButton("📄 PAN Card", callback_data='pan'),
+             InlineKeyboardButton("🏦 IFSC Details", callback_data='ifsc')],
+            [InlineKeyboardButton("💻 GitHub Lookup", callback_data='github')],
+            [InlineKeyboardButton("🔙 Back to Home", callback_data='start')]
+        ]
+        text = f"""🔎 <b>OSINT SEARCH PANEL</b>
+━━━━━━━━━━━━━━━━━━━━
+Select one of the query types below or use the quick commands to start searching immediately.
+
+📖 <b>Quick Search Commands:</b>
+• 📱 Mobile: <code>/mobile 9876543210</code>
+• 🚗 Vehicle 1: <code>/vehicle1 DL3CAS1234</code>
+• 🚙 Vehicle 2: <code>/vehicle2 DL3CAS1234</code>
+• 📄 PAN: <code>/pan ABCDE1234F</code>
+• 💻 GitHub: <code>/github username</code>
+• 🕵️ Leak: <code>/leak email_or_phone</code>
+• 🏦 IFSC: <code>/ifsc SBIN0001234</code>
+━━━━━━━━━━━━━━━━━━━━"""
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return ConversationHandler.END
+
+    elif option == 'menu_rewards':
+        keyboard = [
+            [InlineKeyboardButton("🎁 Daily Check-in", callback_data='checkin'),
+             InlineKeyboardButton("🏆 Leaderboard", callback_data='leaderboard')],
+            [InlineKeyboardButton("🔙 Back to Home", callback_data='start')]
+        ]
+        text = f"""💰 <b>EARN & REWARDS</b>
+━━━━━━━━━━━━━━━━━━━━
+Get free search credits to run queries:
+
+🎁 <b>Daily Check-in:</b> Claim +1 free credit every 24 hours.
+👥 <b>Referrals:</b> Earn +2 credits instantly for every friend who joins using your link.
+🏷️ <b>Promo Codes:</b> Claim promo codes released by admins.
+
+💡 <i>To redeem a promo code, type: <code>/claim &lt;code&gt;</code></i>
+━━━━━━━━━━━━━━━━━━━━"""
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return ConversationHandler.END
+
+    elif option == 'menu_help':
+        help_text = """📖 <b>DETAILDROP BOT USER GUIDE</b>
+━━━━━━━━━━━━━━━━━━━━
+
+🔍 <b>1. OSINT SEARCH ENGINES</b>
+<i>Full searches cost 1 credit. Free searches return masked details.</i>
+
+📱 <b>Mobile Search</b>
+<code>/mobile [phone_number]</code>
+↳ <i>Finds Name, Father, Address, alternate phone, and circle.</i>
+
+🚗 <b>Vehicle RTO Details</b>
+<code>/vehicle1 [RC]</code> or <code>/vehicle2 [RC]</code>
+↳ <i>Finds Owner Name, Model, Insurance details, Reg dates.</i>
+
+📄 <b>PAN Card Lookup</b>
+<code>/pan [pan_number]</code>
+↳ <i>Finds Full Name, Father's Name, DOB, Income, and Phone.</i>
+
+🏦 <b>Bank IFSC Lookup</b>
+<code>/ifsc [ifsc_code]</code>
+↳ <i>Finds Bank Name, Branch, Location, state, and payment support.</i>
+
+🕵️ <b>OSINT Leak Breaches</b>
+<code>/leak [email_or_phone]</code>
+↳ <i>Finds database leak credentials and breach source.</i>
+
+💻 <b>GitHub Profiles</b>
+<code>/github [username]</code>
+↳ <i>Finds Developer bio, repositories count, and stats.</i>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎁 <b>2. EARN FREE SEARCH CREDITS</b>
+<i>Obtain search credits without paying:</i>
+
+▪️ <b>Daily Check-in</b>
+↳ Claim <code>+1 Credit</code> daily by sending `/checkin`.
+
+▪️ <b>Referral Rewards</b>
+↳ Share your referral link (from My Account). Get <code>+2 Credits</code> per join.
+
+▪️ <b>Claim Promo Codes</b>
+↳ Redeem codes using <code>/claim [code]</code> (e.g., <code>/claim FREE10</code>).
+
+━━━━━━━━━━━━━━━━━━━━
+
+📩 <b>3. HELP & SUPPORT TICKETS</b>
+<i>Have issues? Submit a support request directly to admins:</i>
+
+👉 <code>/support [your message]</code>
+↳ <i>Our administrators will reply directly to your chat.</i>
+━━━━━━━━━━━━━━━━━━━━"""
+        keyboard = [[InlineKeyboardButton("🔙 Back to Home", callback_data="start")]]
+        await query.edit_message_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return ConversationHandler.END
+
+    elif option == 'menu_support':
+        text_template = f"Hi! I want to buy a Time Pass for DetailDropBot. My User ID is {user_id}"
+        import urllib.parse
+        encoded_text = urllib.parse.quote(text_template)
+        admin_link = f"https://t.me/{ADMIN_USERNAME}?text={encoded_text}"
+        
+        text = f"""💳 <b>SUPPORT & BUY TIME PASSES</b>
+━━━━━━━━━━━━━━━━━━━━
+Get a Time Pass to continue searching bank, vehicle, mobile, pan, leak, and github details with <b>unlimited queries</b>!
+
+🏷️ <b>Pricing Packages:</b>
+• ⚡ <b>Flash Pass (1 Hour):</b> ₹15
+• 📅 <b>Day Pass (24 Hours):</b> ₹29
+• 🛡️ <b>Weekly Pass (7 Days):</b> ₹79
+• 👑 <b>VIP Month Pass (30 Days):</b> ₹199
+
+🛒 <b>How to Buy:</b>
+Click the button below to message the admin (<b>@{ADMIN_USERNAME}</b>) directly. You will be redirected with your User ID pre-filled.
+
+📩 <b>Support Ticket System:</b>
+If you face any issues, submit a support ticket using:
+<code>/support &lt;your message&gt;</code>
+━━━━━━━━━━━━━━━━━━━━"""
+        keyboard = [
+            [InlineKeyboardButton("💬 Message Admin to Buy", url=admin_link)],
+            [InlineKeyboardButton("📩 Support Info", callback_data="support_info")],
+            [InlineKeyboardButton("🔙 Back to Home", callback_data="start")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return ConversationHandler.END
+
     elif option == 'mobile':
         if not has_user_access_only(user_id):
             allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context)
-            # We always allow search (either masked or full), so has_user_access_only check is just to let buttons trigger
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
         await query.edit_message_text(
             "📱 Send 10-digit mobile number:\nExample: <code>9876543210</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         return WAITING_MOBILE
@@ -1340,38 +1671,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif option == 'vehicle1':
         context.user_data['vehicle_api'] = 1
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
         await query.edit_message_text(
             "🚗 API 1: Send vehicle number\nExample: <code>DL3CAS1234</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         return WAITING_VEHICLE
         
     elif option == 'vehicle2':
         context.user_data['vehicle_api'] = 2
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
         await query.edit_message_text(
             "🚙 API 2: Send vehicle number\nExample: <code>DL3CAS1234</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         return WAITING_VEHICLE
         
     elif option == 'pan':
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
         await query.edit_message_text(
             "📄 Send PAN number:\nExample: <code>ABCDE1234F</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         return WAITING_PAN
         
     elif option == 'github':
-        await query.edit_message_text("💻 Send GitHub username:")
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
+        await query.edit_message_text(
+            "💻 Send GitHub username:\nExample: <code>octocat</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
         return WAITING_GITHUB
         
     elif option == 'leak':
-        await query.edit_message_text("🕵️ Send phone or email:")
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
+        await query.edit_message_text(
+            "🕵️ Send phone or email:\nExample: <code>test@gmail.com</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
         return WAITING_LEAK
         
     elif option == 'ifsc':
+        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
         await query.edit_message_text(
             "🏦 Send IFSC code:\nExample: <code>SBIN0001234</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
         return WAITING_IFSC
@@ -1380,7 +1729,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return ConversationHandler.END
 
-    elif option == 'profile':
+    elif option == 'profile' or option == 'menu_account':
         await show_profile(update, context)
         return ConversationHandler.END
         
@@ -1392,34 +1741,70 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_panel(update, context)
         return ConversationHandler.END
 
-    elif option == 'admin_refresh':
+    elif option == 'checkin':
+        user = update.effective_user
+        user_id = user.id
+        user_data = db.users.find_one({"user_id": user_id})
+        if user_data and user_data.get('banned', False):
+            await query.answer("Blocked", show_alert=True)
+            return ConversationHandler.END
+            
+        last_checkin = user_data.get('last_checkin') if user_data else None
+        now = datetime.utcnow()
+        if last_checkin:
+            if last_checkin.tzinfo is not None:
+                last_checkin = last_checkin.replace(tzinfo=None)
+            elapsed = now - last_checkin
+            if elapsed.total_seconds() < 86400:
+                time_left = 86400 - elapsed.total_seconds()
+                hours = int(time_left // 3600)
+                minutes = int((time_left % 3600) // 60)
+                await query.answer(f"⏳ Already claimed! Try again in {hours}h {minutes}m", show_alert=True)
+                return ConversationHandler.END
+                
+        # Reward
+        db.users.update_one(
+            {"user_id": user_id},
+            {"$inc": {"credits": 1}, "$set": {"last_checkin": now}}
+        )
+        await query.answer("🎁 Daily Check-in Successful! +1 Credit added.", show_alert=True)
+        await show_profile(update, context)
+        return ConversationHandler.END
+        
+    elif option == 'leaderboard':
+        await leaderboard_cmd(update, context)
+        return ConversationHandler.END
+        
+    elif option == 'support_info':
+        await query.answer("📩 Submit support query using:\n/support <your message>", show_alert=True)
+        return ConversationHandler.END
+        
+    elif option == 'admin_toggle_maint':
         if user_id not in ADMIN_IDS:
             await query.answer("Unauthorized", show_alert=True)
             return ConversationHandler.END
-        total_users = db.users.count_documents({})
-        one_hour_ago = datetime.utcnow() - timedelta(hours=1)
-        active_passes = db.users.count_documents({"joined_at": {"$gte": one_hour_ago}})
-        referrals_count = db.users.count_documents({"total_referred": {"$gt": 0}})
+        settings_doc = db.settings.find_one({"_id": "global_settings"})
+        is_maintenance = settings_doc.get('maintenance_mode', False) if settings_doc else False
+        db.settings.update_one({"_id": "global_settings"}, {"$set": {"maintenance_mode": not is_maintenance}})
+        await query.answer(f"Maintenance mode {'disabled' if is_maintenance else 'enabled'}", show_alert=True)
+        await show_admin_panel(update, context)
+        return ConversationHandler.END
         
-        admin_text = f"""📊 <b>ADMIN PANEL</b>
-━━━━━━━━━━━━━━━━━━━━
-👥 <b>Total Users:</b> <code>{total_users}</code>
-⏳ <b>Active Free Passes:</b> <code>{active_passes}</code>
-👥 <b>Active Referrers:</b> <code>{referrals_count}</code>
-
-📝 <b>Quick Commands:</b>
-• Add credits: <code>/addcredit &lt;user_id&gt; &lt;amount&gt;</code>
-• Remove credits: <code>/removecredit &lt;user_id&gt; &lt;amount&gt;</code>
-• User info: <code>/userinfo &lt;user_id&gt;</code>
-• Broadcast: <code>/broadcast &lt;message&gt;</code>
-━━━━━━━━━━━━━━━━━━━━"""
-        
+    elif option == 'admin_api_health' or option == 'admin_refresh_api':
+        if user_id not in ADMIN_IDS:
+            await query.answer("Unauthorized", show_alert=True)
+            return ConversationHandler.END
+        await query.edit_message_text("🔌 <b>Pinging all API endpoints...</b>\n<i>Please wait a few seconds.</i>", parse_mode='HTML')
+        health_text = await check_api_health()
         keyboard = [
-            [InlineKeyboardButton("📊 Refresh Stats", callback_data="admin_refresh")],
-            [InlineKeyboardButton("📢 Send Broadcast", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("🔙 Back to Start", callback_data="start")]
+            [InlineKeyboardButton("🔄 Refresh status", callback_data="admin_refresh_api")],
+            [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
         ]
-        await query.edit_message_text(admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        await query.edit_message_text(health_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return ConversationHandler.END
+
+    elif option == 'admin_refresh':
+        await show_admin_panel(update, context)
         return ConversationHandler.END
 
     elif option == 'admin_broadcast':
@@ -1428,11 +1813,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         broadcast_instr = f"""📢 <b>Send Broadcast</b>
 ━━━━━━━━━━━━━━━━━━━━
-To send a broadcast message to all users, use the command:
-<code>/broadcast &lt;your message here&gt;</code>
-
-Example:
-<code>/broadcast Hello users! We have updated the bot databases.</code>
+To send a broadcast message to all users, please <b>reply to the target message</b> (text, image, video, file, buttons, etc.) with the command:
+<code>/broadcast</code>
 ━━━━━━━━━━━━━━━━━━━━"""
         keyboard = [
             [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_refresh")]
@@ -1612,6 +1994,428 @@ async def handle_ifsc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_formatted_message(update, result, msg, reply_markup=reply_markup)
     return ConversationHandler.END
 
+# ==================== NEW FEATURES & COMMANDS ====================
+
+async def check_api_health() -> str:
+    """Ping all APIs and return formatted health status string"""
+    apis = {
+        "Mobile API": MOBILE_API.format("9876543210"),
+        "Vehicle API 1": VEHICLE_API_1.format("DL3CAS1234"),
+        "Vehicle API 2": VEHICLE_API_2.format("DL3CAS1234"),
+        "PAN API": PAN_API.format("ABCDE1234F"),
+        "GitHub API": GITHUB_API.format("octocat"),
+        "IFSC API": IFSC_API.format("SBIN0001234"),
+        "Leak API": LEAK_API.format("test@gmail.com")
+    }
+    
+    result = "🔌 <b>API HEALTH DASHBOARD</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+    
+    async def ping_api(name, url):
+        try:
+            loop = asyncio.get_event_loop()
+            res = await loop.run_in_executor(
+                None, lambda: requests.get(url, timeout=3)
+            )
+            if res.status_code < 500:
+                return f"🟢 <b>{name}:</b> Online (HTTP {res.status_code})\n"
+            else:
+                return f"🔴 <b>{name}:</b> Server Error (HTTP {res.status_code})\n"
+        except Exception:
+            return f"🔴 <b>{name}:</b> Offline\n"
+            
+    tasks = [ping_api(name, url) for name, url in apis.items()]
+    statuses = await asyncio.gather(*tasks)
+    
+    for s in statuses:
+        result += s
+        
+    result += "━━━━━━━━━━━━━━━━━━━━\n"
+    return result
+
+async def checkin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User Daily Check-in command"""
+    user = update.effective_user
+    user_id = user.id
+    
+    user_data = db.users.find_one({"user_id": user_id})
+    if not user_data:
+        user_data = register_user(user)
+        
+    if user_data.get('banned', False):
+        return
+        
+    last_checkin = user_data.get('last_checkin')
+    now = datetime.utcnow()
+    
+    if last_checkin:
+        if last_checkin.tzinfo is not None:
+            last_checkin = last_checkin.replace(tzinfo=None)
+        elapsed = now - last_checkin
+        if elapsed.total_seconds() < 86400:
+            time_left = 86400 - elapsed.total_seconds()
+            hours = int(time_left // 3600)
+            minutes = int((time_left % 3600) // 60)
+            await update.message.reply_text(
+                f"⏳ <b>Already Claimed!</b>\n━━━━━━━━━━━━━━━━━━━━\nYou have already checked in today.\n💡 Please try again in <b>{hours}h {minutes}m</b>.",
+                parse_mode='HTML'
+            )
+            return
+            
+    db.users.update_one(
+        {"user_id": user_id},
+        {"$inc": {"credits": 1}, "$set": {"last_checkin": now}}
+    )
+    
+    await update.message.reply_text(
+        f"🎁 <b>Daily Check-in Successful!</b>\n━━━━━━━━━━━━━━━━━━━━\n🎉 <b>+1 Credit</b> has been added to your balance!\n💰 Use /profile to view your balance.",
+        parse_mode='HTML'
+    )
+
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show top referrers"""
+    user = update.effective_user
+    user_id = user.id
+    
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False):
+        return
+        
+    top_users = db.users.find({}).sort("total_referred", -1).limit(10)
+    
+    text = f"🏆 <b>REFERRAL LEADERBOARD</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+    rank = 1
+    emojis = {1: "🥇", 2: "🥈", 3: "🥉"}
+    
+    for u in top_users:
+        ref_count = u.get('total_referred', 0)
+        first_name = escape_html(u.get('first_name', 'User'))
+        username = u.get('username')
+        user_mention = f"@{escape_html(username)}" if username else first_name
+        
+        rank_emoji = emojis.get(rank, "🔹")
+        text += f"{rank_emoji} <b>{rank}.</b> {user_mention} — <code>{ref_count} refs</code>\n"
+        rank += 1
+        
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Start", callback_data="start")]]
+    
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        await update.message.reply_text(text, parse_mode='HTML')
+
+async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User support request command"""
+    user = update.effective_user
+    user_id = user.id
+    
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False):
+        return
+        
+    if not context.args:
+        await update.message.reply_text(
+            format_error("Missing Input", "Usage: /support <your message>\nExample: /support Hi, my credits didn't update."),
+            parse_mode='HTML'
+        )
+        return
+        
+    message_text = " ".join(context.args)
+    
+    admin_notified = 0
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"📩 <b>NEW SUPPORT TICKET</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>From:</b> {escape_html(user.first_name)} (@{escape_html(user.username) if user.username else 'N/A'})\n🆔 <b>User ID:</b> <code>{user_id}</code>\n📝 <b>Message:</b> <i>{escape_html(message_text)}</i>\n━━━━━━━━━━━━━━━━━━━━\n💡 <i>To reply, use: <code>/reply {user_id} &lt;your reply&gt;</code></i>",
+                parse_mode='HTML'
+            )
+            admin_notified += 1
+        except Exception as e:
+            logger.error(f"Failed to send support ticket to admin {admin_id}: {e}")
+            
+    if admin_notified > 0:
+        await update.message.reply_text(
+            "✅ <b>Support Ticket Submitted!</b>\n━━━━━━━━━━━━━━━━━━━━\nYour query has been forwarded to the administration. We will reply to you shortly.",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            format_error("Error", "Support system is currently unreachable. Please try again later."),
+            parse_mode='HTML'
+        )
+
+async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin reply to support ticket command"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+        
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /reply <user_id> <reply message>",
+            parse_mode='HTML'
+        )
+        return
+        
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Error: User ID must be a number.", parse_mode='HTML')
+        return
+        
+    reply_text = " ".join(context.args[1:])
+    
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"📩 <b>SUPPORT REPLY</b>\n━━━━━━━━━━━━━━━━━━━━\n🛠️ <b>Admin Team:</b> <i>{escape_html(reply_text)}</i>\n━━━━━━━━━━━━━━━━━━━━",
+            parse_mode='HTML'
+        )
+        await update.message.reply_text(f"✅ Reply successfully sent to User ID <code>{target_id}</code>.", parse_mode='HTML')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send reply to user: {e}", parse_mode='HTML')
+
+async def genpromo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin generate promo code command"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+        
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: /genpromo <code> <credits> <max_uses>",
+            parse_mode='HTML'
+        )
+        return
+        
+    code = context.args[0].strip().upper()
+    try:
+        credits = int(context.args[1])
+        max_uses = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("Error: Credits and Max Uses must be integers.", parse_mode='HTML')
+        return
+        
+    existing = db.promocodes.find_one({"code": code})
+    if existing:
+        await update.message.reply_text(f"❌ Promo code <code>{code}</code> already exists.", parse_mode='HTML')
+        return
+        
+    db.promocodes.insert_one({
+        "code": code,
+        "credits": credits,
+        "max_uses": max_uses,
+        "uses_count": 0,
+        "claimed_by": []
+    })
+    
+    await update.message.reply_text(
+        f"✅ <b>Promo Code Created!</b>\n━━━━━━━━━━━━━━━━━━━━\n🔑 <b>Code:</b> <code>{code}</code>\n💰 <b>Credits:</b> <code>{credits}</code>\n👥 <b>Max Uses:</b> <code>{max_uses}</code>\n━━━━━━━━━━━━━━━━━━━━",
+        parse_mode='HTML'
+    )
+
+async def claim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User claim promo code command"""
+    user = update.effective_user
+    user_id = user.id
+    
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False):
+        return
+        
+    if not context.args:
+        await update.message.reply_text(
+            format_error("Missing Input", "Usage: /claim <code>\nExample: /claim FREE10"),
+            parse_mode='HTML'
+        )
+        return
+        
+    code = context.args[0].strip().upper()
+    promo = db.promocodes.find_one({"code": code})
+    
+    if not promo:
+        await update.message.reply_text(
+            format_error("Invalid Code", "This promo code does not exist or has expired."),
+            parse_mode='HTML'
+        )
+        return
+        
+    if user_id in promo.get('claimed_by', []):
+        await update.message.reply_text(
+            format_error("Already Claimed", "You have already claimed this promo code!"),
+            parse_mode='HTML'
+        )
+        return
+        
+    if promo.get('uses_count', 0) >= promo.get('max_uses', 0):
+        await update.message.reply_text(
+            format_error("Limit Reached", "This promo code's maximum claims limit has been reached."),
+            parse_mode='HTML'
+        )
+        return
+        
+    credits_reward = promo.get('credits', 0)
+    db.promocodes.update_one(
+        {"code": code},
+        {"$inc": {"uses_count": 1}, "$push": {"claimed_by": user_id}}
+    )
+    db.users.update_one(
+        {"user_id": user_id},
+        {"$inc": {"credits": credits_reward}}
+    )
+    
+    await update.message.reply_text(
+        f"🎉 <b>Promo Code Claimed!</b>\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>+{credits_reward} Credits</b> have been added to your balance!\n👤 Use /profile to view your balance.",
+        parse_mode='HTML'
+    )
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin ban user command"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+        
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <user_id>", parse_mode='HTML')
+        return
+        
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Error: User ID must be a number.", parse_mode='HTML')
+        return
+        
+    res = db.users.update_one({"user_id": target_id}, {"$set": {"banned": True}})
+    if res.matched_count > 0:
+        await update.message.reply_text(f"✅ User ID <code>{target_id}</code> has been successfully <b>BANNED</b>.", parse_mode='HTML')
+        try:
+            await context.bot.send_message(chat_id=target_id, text="❌ <b>Your account has been banned by the Administrator.</b>", parse_mode='HTML')
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text("❌ User not found in database.", parse_mode='HTML')
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin unban user command"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+        
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <user_id>", parse_mode='HTML')
+        return
+        
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Error: User ID must be a number.", parse_mode='HTML')
+        return
+        
+    res = db.users.update_one({"user_id": target_id}, {"$set": {"banned": False}})
+    if res.matched_count > 0:
+        await update.message.reply_text(f"✅ User ID <code>{target_id}</code> has been successfully <b>UNBANNED</b>.", parse_mode='HTML')
+        try:
+            await context.bot.send_message(chat_id=target_id, text="✅ <b>Your account has been unbanned by the Administrator. Access restored.</b>", parse_mode='HTML')
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text("❌ User not found in database.", parse_mode='HTML')
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User Help command"""
+    user_id = update.effective_user.id
+    user_data = db.users.find_one({"user_id": user_id})
+    if user_data and user_data.get('banned', False):
+        return
+        
+    help_text = """📖 <b>DETAILDROP BOT USER GUIDE</b>
+━━━━━━━━━━━━━━━━━━━━
+
+🔍 <b>1. OSINT SEARCH ENGINES</b>
+<i>Full searches cost 1 credit. Free searches return masked details.</i>
+
+📱 <b>Mobile Search</b>
+<code>/mobile [phone_number]</code>
+↳ <i>Finds Name, Father, Address, alternate phone, and circle.</i>
+
+🚗 <b>Vehicle RTO Details</b>
+<code>/vehicle1 [RC]</code> or <code>/vehicle2 [RC]</code>
+↳ <i>Finds Owner Name, Model, Insurance details, Reg dates.</i>
+
+📄 <b>PAN Card Lookup</b>
+<code>/pan [pan_number]</code>
+↳ <i>Finds Full Name, Father's Name, DOB, Income, and Phone.</i>
+
+🏦 <b>Bank IFSC Lookup</b>
+<code>/ifsc [ifsc_code]</code>
+↳ <i>Finds Bank Name, Branch, Location, state, and payment support.</i>
+
+🕵️ <b>OSINT Leak Breaches</b>
+<code>/leak [email_or_phone]</code>
+↳ <i>Finds database leak credentials and breach source.</i>
+
+💻 <b>GitHub Profiles</b>
+<code>/github [username]</code>
+↳ <i>Finds Developer bio, repositories count, and stats.</i>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎁 <b>2. EARN FREE SEARCH CREDITS</b>
+<i>Obtain search credits without paying:</i>
+
+▪️ <b>Daily Check-in</b>
+↳ Claim <code>+1 Credit</code> daily by sending `/checkin`.
+
+▪️ <b>Referral Rewards</b>
+↳ Share your referral link (from My Account). Get <code>+2 Credits</code> per join.
+
+▪️ <b>Claim Promo Codes</b>
+↳ Redeem codes using <code>/claim [code]</code> (e.g., <code>/claim FREE10</code>).
+
+━━━━━━━━━━━━━━━━━━━━
+
+📩 <b>3. HELP & SUPPORT TICKETS</b>
+<i>Have issues? Submit a support request directly to admins:</i>
+
+👉 <code>/support [your message]</code>
+↳ <i>Our administrators will reply directly to your chat.</i>
+━━━━━━━━━━━━━━━━━━━━
+<i>💡 Tip: Click 'Search DB Panel' on the home dashboard to run queries using buttons!</i>"""
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin Help command"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+        
+    admin_help_text = """👑 <b>DETAILDROP ADMIN COMMAND GUIDE</b>
+━━━━━━━━━━━━━━━━━━━━
+Here is the category-wise administrative control panel commands:
+
+💰 <b>1. CREDIT & WALLET OPERATIONS</b>
+Manage credit balances for users directly:
+• <code>/addcredit &lt;user_id&gt; &lt;amount&gt;</code> — Give credits to a user.
+• <code>/removecredit &lt;user_id&gt; &lt;amount&gt;</code> — Deduct credits from a user's wallet.
+
+🚫 <b>2. USER ACCESS CONTROL & AUDITING</b>
+Investigate and block malicious actors:
+• <code>/ban &lt;user_id&gt;</code> — Restrict access. Banned users are blocked immediately from running any query.
+• <code>/unban &lt;user_id&gt;</code> — Restore bot access.
+• <code>/userinfo &lt;user_id&gt;</code> — Pull user profile stats, joined date, total referrals, and bypass status.
+• <b>Maintenance Mode:</b> Toggle it from the Admin Panel (`/admin`) to block non-admin users during updates.
+
+📩 <b>3. SUPPORT TICKET REPLIES</b>
+Address user queries directly:
+• <code>/reply &lt;user_id&gt; &lt;message&gt;</code> — Send a direct notification with your reply back to the user.
+
+🏷️ <b>4. PROMO CODE GENERATOR</b>
+Create coupon codes for marketing or gifts:
+• <code>/genpromo &lt;code&gt; &lt;credits&gt; &lt;max_uses&gt;</code> — Generate a redeemable code (e.g. <code>/genpromo FREE10 10 50</code>).
+
+📢 <b>5. BROADCAST SYSTEM</b>
+• <b>Usage:</b> Reply to any channel post or message containing text, photo, video, document, voice note, or interactive buttons with <code>/broadcast</code> to forward it exactly as-is to all users.
+━━━━━━━━━━━━━━━━━━━━"""
+    await update.message.reply_text(admin_help_text, parse_mode='HTML')
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel current operation"""
     await update.message.reply_text(
@@ -1700,6 +2504,8 @@ def main():
     app.add_handler(CommandHandler('admin', admin_cmd))
     app.add_handler(CommandHandler('addcredit', addcredit_cmd))
     app.add_handler(CommandHandler('removecredit', removecredit_cmd))
+    app.add_handler(CommandHandler('addpass', addpass_cmd))
+    app.add_handler(CommandHandler('addpassdays', addpassdays_cmd))
     app.add_handler(CommandHandler('userinfo', userinfo_cmd))
     app.add_handler(CommandHandler('broadcast', broadcast_cmd))
     app.add_handler(CommandHandler('mobile', mobile_cmd))
@@ -1710,6 +2516,16 @@ def main():
     app.add_handler(CommandHandler('github', github_cmd))
     app.add_handler(CommandHandler('leak', leak_cmd))
     app.add_handler(CommandHandler('ifsc', ifsc_cmd))
+    app.add_handler(CommandHandler('checkin', checkin_cmd))
+    app.add_handler(CommandHandler('leaderboard', leaderboard_cmd))
+    app.add_handler(CommandHandler('support', support_cmd))
+    app.add_handler(CommandHandler('reply', reply_cmd))
+    app.add_handler(CommandHandler('genpromo', genpromo_cmd))
+    app.add_handler(CommandHandler('claim', claim_cmd))
+    app.add_handler(CommandHandler('ban', ban_cmd))
+    app.add_handler(CommandHandler('unban', unban_cmd))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CommandHandler('adminhelp', adminhelp_cmd))
     app.add_handler(conv_handler)
     
     print("[INFO] Bot is running!")
