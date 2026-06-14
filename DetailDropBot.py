@@ -56,10 +56,9 @@ FORCE_JOIN_GROUP_LINK = "https://t.me/DetailDropGroup"
 FORCE_JOIN_CHANNEL_ID = -1003718462382
 FORCE_JOIN_CHANNEL_LINK = "https://t.me/DetailDrop"
 
-FORCE_JOIN_TEXT = """⚠️ <b>Access Locked: Member Verification</b>
+FORCE_JOIN_TEXT = """📢 <b>Connect to our Community</b>
 ━━━━━━━━━━━━━━━━━━━━
-Please join our networks below to search vehicle, mobile, PAN, and bank details:
-━━━━━━━━━━━━━━━━━━━━"""
+Join our channels below to unlock search database access, get server status reports, and receive the latest cyber-intelligence updates."""
 
 def get_force_join_keyboard():
     keyboard = [
@@ -196,16 +195,17 @@ def has_user_access_only(user_id):
         return True
     return user_data.get('credits', 0) >= 1
 
-async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, bool, str, InlineKeyboardMarkup]:
+async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE, deduct_credit: bool = True) -> tuple[bool, bool, str, InlineKeyboardMarkup]:
     """Check if the user has an active free pass or has credit, checking ban and maintenance status first. Returns (allowed, masked, error_msg, reply_markup)"""
     user_id = user.id
     user_data = db.users.find_one({"user_id": user_id})
 
     # Admin has absolute access & bypasses all checks immediately
     if user_id in ADMIN_IDS:
-        db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
-        if user_data:
-            db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
+        if deduct_credit:
+            db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
+            if user_data:
+                db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
         return True, False, "", None
         
     # 1. Ban Check
@@ -226,6 +226,15 @@ async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE) -> tuple[b
     if not user_data:
         user_data = register_user(user)
         
+    if not deduct_credit:
+        time_left = get_pass_time_left(user_data)
+        if time_left > 0:
+            return True, False, "", None
+        credits = user_data.get('credits', 0)
+        if credits >= 1:
+            return True, False, "", None
+        return True, True, "", None
+
     # Increment queries count for successful attempt
     db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
     db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
@@ -1648,9 +1657,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # Pre-check search query options for bans, maintenance, and force join
     if option in ['mobile', 'vehicle1', 'vehicle2', 'pan', 'github', 'leak', 'ifsc']:
-        allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context)
+        allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context, deduct_credit=False)
         if not allowed:
-            if "Access Locked" in err_msg:
+            if err_msg == FORCE_JOIN_TEXT:
                 # If blocked due to force join, answer the callback and edit the lock screen inline
                 await query.answer()
                 await query.edit_message_text(
@@ -1868,7 +1877,7 @@ If you face any issues, submit a support ticket using:
 
     elif option == 'mobile':
         if not has_user_access_only(user_id):
-            allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context)
+            allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context, deduct_credit=False)
         keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
         await query.edit_message_text(
             "📱 Send 10-digit mobile number:\nExample: <code>9876543210</code>",
