@@ -58,10 +58,7 @@ FORCE_JOIN_CHANNEL_LINK = "https://t.me/DetailDrop"
 
 FORCE_JOIN_TEXT = """⚠️ <b>Access Locked: Member Verification</b>
 ━━━━━━━━━━━━━━━━━━━━
-Please join our networks to search vehicle, mobile, PAN, and bank details:
-
-1. 💬 <a href="https://t.me/DetailDropGroup">Public Group</a>
-2. 📢 <a href="https://t.me/DetailDrop">Public Channel</a>
+Please join our networks below to search vehicle, mobile, PAN, and bank details:
 ━━━━━━━━━━━━━━━━━━━━"""
 
 def get_force_join_keyboard():
@@ -72,30 +69,42 @@ def get_force_join_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-async def check_force_join(user_id: int, bot) -> bool:
-    """Verify if user has joined both the public group and channel. Bot admins bypass this."""
+async def check_force_join_status(user_id: int, bot) -> tuple[bool, str]:
+    """Verify membership details and return (is_joined, missing_chat_type)"""
     if user_id in ADMIN_IDS:
-        return True
+        return True, ""
         
-    # Check Group
+    group_joined = True
     try:
         member = await bot.get_chat_member(chat_id=FORCE_JOIN_GROUP_ID, user_id=user_id)
         if member.status not in ['member', 'restricted', 'administrator', 'creator']:
-            return False
+            group_joined = False
     except Exception as e:
         logger.error(f"Error checking group membership for {user_id}: {e}")
-        return False
+        group_joined = False
         
-    # Check Channel
+    channel_joined = True
     try:
         member = await bot.get_chat_member(chat_id=FORCE_JOIN_CHANNEL_ID, user_id=user_id)
         if member.status not in ['member', 'restricted', 'administrator', 'creator']:
-            return False
+            channel_joined = False
     except Exception as e:
         logger.error(f"Error checking channel membership for {user_id}: {e}")
-        return False
+        channel_joined = False
         
-    return True
+    if group_joined and channel_joined:
+        return True, ""
+    elif not group_joined and not channel_joined:
+        return False, "both"
+    elif not group_joined:
+        return False, "group"
+    else:
+        return False, "channel"
+
+async def check_force_join(user_id: int, bot) -> bool:
+    """Verify if user has joined both networks (bool return for compatibility)"""
+    joined, _ = await check_force_join_status(user_id, bot)
+    return joined
 
 def private_chat_only(func):
     """Decorator to restrict handler execution strictly to private chats (DMs), except for bot admins"""
@@ -1629,6 +1638,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline button presses"""
     query = update.callback_query
     user_id = update.effective_user.id
+    option = query.data
     
     # Check if banned (admins bypass)
     user_data = db.users.find_one({"user_id": user_id})
@@ -1636,8 +1646,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Your account has been banned by the Administrator.", show_alert=True)
         return ConversationHandler.END
         
+    # Pre-check search query options for bans, maintenance, and force join
+    if option in ['mobile', 'vehicle1', 'vehicle2', 'pan', 'github', 'leak', 'ifsc']:
+        allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context)
+        if not allowed:
+            if "Access Locked" in err_msg:
+                # If blocked due to force join, answer the callback and edit the lock screen inline
+                await query.answer()
+                await query.edit_message_text(
+                    err_msg,
+                    reply_markup=reply_markup,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True
+                )
+            else:
+                # Banned or Maintenance: show popup modal alert (stripping HTML tags)
+                clean_msg = re.sub(r'<[^>]*>', '', err_msg)
+                await query.answer(clean_msg, show_alert=True)
+            return ConversationHandler.END
+
     await query.answer()
-    option = query.data
     
     if option.startswith('leak_page:'):
         page_index = int(option.split(':')[1])
@@ -1693,7 +1721,7 @@ Select one of the query types below or use the quick commands to start searching
         return ConversationHandler.END
 
     elif option == 'verify_force_join':
-        joined = await check_force_join(user_id, context.bot)
+        joined, missing = await check_force_join_status(user_id, context.bot)
         if joined:
             await query.answer("✅ Verification Successful! Access Granted.", show_alert=True)
             # Show the Search DB Panel (menu_search)
@@ -1722,7 +1750,13 @@ Select one of the query types below or use the quick commands to start searching
 ━━━━━━━━━━━━━━━━━━━━"""
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         else:
-            await query.answer("❌ Verification Failed: You must join both the group and channel first!", show_alert=True)
+            if missing == "both":
+                msg = "❌ Verification Failed: You must join both our Public Group and Channel first!"
+            elif missing == "group":
+                msg = "❌ Verification Failed: You haven't joined our Public Group yet!"
+            else:
+                msg = "❌ Verification Failed: You haven't joined our Public Channel yet!"
+            await query.answer(msg, show_alert=True)
         return ConversationHandler.END
 
     elif option == 'menu_rewards':
