@@ -21,6 +21,19 @@ resolver = dns.resolver.Resolver(configure=False)
 resolver.nameservers = ['2001:4860:4860::8888', '2001:4860:4860::8844', '8.8.8.8', '8.8.4.4']
 dns.resolver.default_resolver = resolver
 import pymongo
+import psutil
+
+# Startup time and API Status cache
+STARTUP_TIME = datetime.utcnow()
+API_STATUSES = {
+    "mobile": "🟢",
+    "pan": "🟢",
+    "ifsc": "🟢",
+    "vehicle1": "🟢",
+    "vehicle2": "🟢",
+    "leak": "🟢",
+    "github": "🟢"
+}
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAFzsIOx2mWpxbXNdqlO7rr0n_BsxbTdYM4")
@@ -158,7 +171,8 @@ def register_user(user, ref_id=None):
             "total_referred": 0,
             "banned": False,
             "last_checkin": None,
-            "queries_count": 0
+            "queries_count": 0,
+            "last_active": joined_at
         }
         db.users.insert_one(user_data)
         logger.info(f"Registered new user: {user_id} (Referrer: {ref_id})")
@@ -199,7 +213,31 @@ def has_user_access_only(user_id):
         return True
     return user_data.get('credits', 0) >= 1
 
-async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE, deduct_credit: bool = True) -> tuple[bool, bool, str, InlineKeyboardMarkup]:
+def record_query_activity(query_type=None):
+    """Update global settings with total, daily, and type-based query stats"""
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    settings_doc = db.settings.find_one({"_id": "global_settings"})
+    last_query_date = settings_doc.get("last_query_date") if settings_doc else None
+    
+    inc_dict = {"total_queries": 1}
+    set_dict = {"last_active": datetime.utcnow()}
+    
+    if last_query_date == today_str:
+        inc_dict["queries_today"] = 1
+    else:
+        set_dict["queries_today"] = 1
+        set_dict["last_query_date"] = today_str
+        
+    if query_type:
+        inc_dict[f"queries_by_type.{query_type}"] = 1
+        
+    db.settings.update_one(
+        {"_id": "global_settings"},
+        {"$inc": inc_dict, "$set": set_dict},
+        upsert=True
+    )
+
+async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE, deduct_credit: bool = True, query_type: str = None) -> tuple[bool, bool, str, InlineKeyboardMarkup]:
     """Check if the user has an active free pass or has credit, checking ban and maintenance status first. Returns (allowed, masked, error_msg, reply_markup)"""
     user_id = user.id
     user_data = db.users.find_one({"user_id": user_id})
@@ -207,9 +245,9 @@ async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE, deduct_cre
     # Admin has absolute access & bypasses all checks immediately
     if user_id in ADMIN_IDS:
         if deduct_credit:
-            db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
+            record_query_activity(query_type)
             if user_data:
-                db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
+                db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}, "$set": {"last_active": datetime.utcnow()}})
         return True, False, "", None
         
     # 1. Ban Check
@@ -229,6 +267,8 @@ async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE, deduct_cre
         
     if not user_data:
         user_data = register_user(user)
+    else:
+        db.users.update_one({"user_id": user_id}, {"$set": {"last_active": datetime.utcnow()}})
         
     if not deduct_credit:
         time_left = get_pass_time_left(user_data)
@@ -240,7 +280,7 @@ async def check_user_access(user, context: ContextTypes.DEFAULT_TYPE, deduct_cre
         return True, True, "", None
 
     # Increment queries count for successful attempt
-    db.settings.update_one({"_id": "global_settings"}, {"$inc": {"total_queries": 1}})
+    record_query_activity(query_type)
     db.users.update_one({"user_id": user_id}, {"$inc": {"queries_count": 1}})
         
     time_left = get_pass_time_left(user_data)
@@ -387,29 +427,166 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("❌ <b>Unauthorized:</b> This command is only for admins.", parse_mode='HTML')
         return
         
-    total_users = db.users.count_documents({})
-    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
-    active_passes = db.users.count_documents({"joined_at": {"$gte": one_hour_ago}})
-    referrals_count = db.users.count_documents({"total_referred": {"$gt": 0}})
+    now = datetime.utcnow()
     
+    # 1. User counters
+    total_users = db.users.count_documents({})
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    new_users_today = db.users.count_documents({"joined_at": {"$gte": today_start}})
+    
+    premium_users = db.users.count_documents({"pass_expiry": {"$gt": now}})
+    banned_users = db.users.count_documents({"banned": True})
+    
+    # 2. Credits in circulation
+    credits_pipeline = [{"$group": {"_id": None, "total": {"$sum": "$credits"}}}]
+    credits_result = list(db.users.aggregate(credits_pipeline))
+    total_credits = credits_result[0]["total"] if credits_result else 0
+    
+    # 3. Community growth
+    referrals_pipeline = [{"$group": {"_id": None, "total": {"$sum": "$total_referred"}}}]
+    referrals_result = list(db.users.aggregate(referrals_pipeline))
+    total_referrals = referrals_result[0]["total"] if referrals_result else 0
+    
+    top_referrer_doc = db.users.find_one({"total_referred": {"$gt": 0}}, sort=[("total_referred", -1)])
+    if top_referrer_doc:
+        top_ref_name = f"@{top_referrer_doc.get('username')}" if top_referrer_doc.get('username') else top_referrer_doc.get('first_name')
+        top_referrer = f"{top_ref_name} ({top_referrer_doc.get('total_referred')} joins)"
+    else:
+        top_referrer = "N/A"
+        
+    last_active_doc = db.users.find_one({"last_active": {"$ne": None}}, sort=[("last_active", -1)])
+    if last_active_doc:
+        last_active_time = last_active_doc.get('last_active')
+        if last_active_time.tzinfo is not None:
+            last_active_time = last_active_time.replace(tzinfo=None)
+        elapsed_sec = (now - last_active_time).total_seconds()
+        if elapsed_sec < 60:
+            elapsed_str = f"{int(elapsed_sec)}s ago"
+        elif elapsed_sec < 3600:
+            elapsed_str = f"{int(elapsed_sec // 60)}m ago"
+        else:
+            elapsed_str = f"{int(elapsed_sec // 3600)}h ago"
+        last_active_name = f"@{last_active_doc.get('username')}" if last_active_doc.get('username') else last_active_doc.get('first_name')
+        last_activity = f"{last_active_name} ({elapsed_str})"
+    else:
+        last_activity = "N/A"
+        
+    # 4. Search popularity & Global settings
     settings_doc = db.settings.find_one({"_id": "global_settings"})
     if not settings_doc:
         settings_doc = {
             "maintenance_mode": False,
-            "total_queries": 0
+            "total_queries": 0,
+            "queries_today": 0,
+            "queries_by_type": {}
         }
     is_maintenance = settings_doc.get('maintenance_mode', False)
     total_queries = settings_doc.get('total_queries', 0)
+    queries_today = settings_doc.get('queries_today', 0)
+    
+    last_query_date = settings_doc.get("last_query_date")
+    today_str = now.strftime("%Y-%m-%d")
+    if last_query_date != today_str:
+        queries_today = 0
+        
+    queries_by_type = settings_doc.get('queries_by_type', {})
+    mobile_count = queries_by_type.get('mobile', 0)
+    vehicle_count = queries_by_type.get('vehicle1', 0) + queries_by_type.get('vehicle2', 0)
+    pan_count = queries_by_type.get('pan', 0)
+    leak_count = queries_by_type.get('leak', 0)
+    ifsc_count = queries_by_type.get('ifsc', 0)
+    github_count = queries_by_type.get('github', 0)
+    
+    pop_list = [
+        ("📱 Mobile", mobile_count),
+        ("🚗 Vehicle", vehicle_count),
+        ("📄 PAN", pan_count),
+        ("🕵️ Leak", leak_count),
+        ("🏦 IFSC", ifsc_count),
+        ("💻 GitHub", github_count)
+    ]
+    pop_list.sort(key=lambda x: x[1], reverse=True)
+    popularity_str = " > ".join([f"{name} ({count})" for name, count in pop_list])
+    
+    # 5. Active passes breakdown
+    pass_users = db.users.find({"pass_expiry": {"$gt": now}})
+    pass_1h = 0
+    pass_24h = 0
+    pass_7d = 0
+    pass_30d = 0
+    for u in pass_users:
+        expiry = u.get('pass_expiry')
+        if expiry:
+            if expiry.tzinfo is not None:
+                expiry = expiry.replace(tzinfo=None)
+            rem_h = (expiry - now).total_seconds() / 3600.0
+            if rem_h <= 1.0:
+                pass_1h += 1
+            elif rem_h <= 24.0:
+                pass_24h += 1
+            elif rem_h <= 168.0:
+                pass_7d += 1
+            else:
+                pass_30d += 1
+                
+    # 6. Pending support tickets
+    pending_tickets = db.tickets.count_documents({"status": "pending"})
+    
+    # 7. Server CPU & RAM
+    try:
+        cpu_usage = psutil.cpu_percent()
+        ram_usage = psutil.virtual_memory().percent
+    except Exception:
+        cpu_usage = 0
+        ram_usage = 0
+        
+    # 8. Bot Uptime
+    uptime = now - STARTUP_TIME
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    
+    uptime_parts = []
+    if days > 0:
+        uptime_parts.append(f"{days} day{'s' if days > 1 else ''}")
+    if hours > 0:
+        uptime_parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
+    if minutes > 0 or not uptime_parts:
+        uptime_parts.append(f"{minutes} minute{'s' if minutes > 1 else ''}")
+    uptime_str = ", ".join(uptime_parts)
     
     maintenance_status = "🟢 <b>INACTIVE</b>" if not is_maintenance else "🔴 <b>ACTIVE (Admins Only)</b>"
     
-    admin_text = f"""📊 <b>ADMIN PANEL</b>
+    admin_text = f"""📊 <b>SYSTEM STATISTICS</b>
 ━━━━━━━━━━━━━━━━━━━━
-👥 <b>Total Users:</b> <code>{total_users}</code>
-⏳ <b>Active Free Passes:</b> <code>{active_passes}</code>
-👥 <b>Active Referrers:</b> <code>{referrals_count}</code>
-🔍 <b>Total Queries Run:</b> <code>{total_queries}</code>
-🔧 <b>Maintenance Mode:</b> {maintenance_status}
+👥 <b>Total Users:</b> <code>{total_users}</code> (+{new_users_today} today)
+👑 <b>Premium Users:</b> <code>{premium_users}</code> | 🚫 <b>Banned:</b> <code>{banned_users}</code>
+🔍 <b>Total Queries Run:</b> <code>{total_queries}</code> ({queries_today} today)
+💳 <b>Credits in Circulation:</b> <code>{total_credits}</code>
+
+📈 <b>COMMUNITY GROWTH:</b>
+• 👥 <b>Total Referrals:</b> <code>{total_referrals} joins</code>
+• 🏆 <b>Top Referrer:</b> <code>{top_referrer}</code>
+• 🕒 <b>Last Activity:</b> <code>{last_activity}</code>
+
+🔥 <b>SEARCH POPULARITY:</b>
+• <code>{popularity_str}</code>
+
+⏳ <b>ACTIVE PASSES:</b>
+• ⚡ 1h: <code>{pass_1h}</code> | 📅 24h: <code>{pass_24h}</code> | 🛡️ 7d: <code>{pass_7d}</code> | 👑 30d: <code>{pass_30d}</code>
+
+📩 <b>OUTSTANDING TICKETS:</b>
+• 🎫 <b>Pending Support:</b> <code>{pending_tickets} tickets</code> {"⚠️" if pending_tickets > 0 else ""}
+
+🔌 <b>API STATUS:</b>
+• 📱 Mobile: {API_STATUSES.get('mobile', '🟢')} | 📄 PAN: {API_STATUSES.get('pan', '🟢')} | 🏦 IFSC: {API_STATUSES.get('ifsc', '🟢')}
+• 🚗 Vehicle 1: {API_STATUSES.get('vehicle1', '🟢')} | 🚙 Vehicle 2: {API_STATUSES.get('vehicle2', '🟢')} | 🕵️ Leak: {API_STATUSES.get('leak', '🟢')}
+
+⚡ <b>SYSTEM INFO:</b>
+• 🔧 <b>Maintenance:</b> {maintenance_status}
+• 🖥️ <b>Server CPU:</b> <code>{cpu_usage}%</code> | 💾 <b>RAM:</b> <code>{ram_usage}%</code>
+• ⏱️ <b>Bot Uptime:</b> <code>{uptime_str}</code>
+━━━━━━━━━━━━━━━━━━━━
 
 📝 <b>Quick Commands:</b>
 • Add credits: <code>/addcredit &lt;user_id&gt; &lt;amount&gt;</code>
@@ -747,6 +924,42 @@ def handle_api_exception(name: str, e: Exception) -> str:
     elif isinstance(e, (json.JSONDecodeError, ValueError)):
         return format_error(f"{name} Error", "Received an invalid response format from the database server.")
     return format_error(f"{name} Error", str(e))
+
+async def update_api_status_loop():
+    """Periodically check API status in background"""
+    await asyncio.sleep(5) # Delay initial check to let bot start smoothly
+    apis = {
+        "mobile": MOBILE_API.format("9876543210"),
+        "vehicle1": VEHICLE_API_1.format("DL3CAS1234"),
+        "vehicle2": VEHICLE_API_2.format("DL3CAS1234"),
+        "pan": PAN_API.format("ABCDE1234F"),
+        "github": GITHUB_API.format("octocat"),
+        "ifsc": IFSC_API.format("SBIN0001234"),
+        "leak": LEAK_API.format("test@gmail.com")
+    }
+    
+    async def ping(name, url):
+        try:
+            loop = asyncio.get_event_loop()
+            res = await loop.run_in_executor(
+                None, lambda: requests.get(url, timeout=3)
+            )
+            if res.status_code < 500:
+                return name, "🟢"
+            else:
+                return name, "🔴"
+        except Exception:
+            return name, "🔴"
+
+    while True:
+        try:
+            tasks = [ping(name, url) for name, url in apis.items()]
+            results = await asyncio.gather(*tasks)
+            for name, status in results:
+                API_STATUSES[name] = status
+        except Exception as e:
+            logger.error(f"Error in background API check: {e}")
+        await asyncio.sleep(300)
 
 async def send_temp_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode: str = 'HTML', delay: int = 15, reply_markup=None):
     """Sends a message and schedules it to be deleted after `delay` seconds"""
@@ -1466,7 +1679,7 @@ async def mobile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='mobile')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -1498,7 +1711,7 @@ async def vehicle1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='vehicle1')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -1530,7 +1743,7 @@ async def vehicle2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='vehicle2')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -1562,7 +1775,7 @@ async def pan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='pan')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -1594,7 +1807,7 @@ async def github_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='github')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -1618,7 +1831,7 @@ async def leak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='leak')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -1671,7 +1884,7 @@ async def ifsc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='ifsc')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return
@@ -2125,7 +2338,7 @@ async def handle_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_MOBILE
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='mobile')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return ConversationHandler.END
@@ -2153,7 +2366,7 @@ async def handle_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_VEHICLE
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type=f'vehicle{api}')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return ConversationHandler.END
@@ -2180,7 +2393,7 @@ async def handle_pan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_PAN
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='pan')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return ConversationHandler.END
@@ -2206,7 +2419,7 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_GITHUB
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='github')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return ConversationHandler.END
@@ -2232,7 +2445,7 @@ async def handle_leak(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_LEAK
     
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='leak')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return ConversationHandler.END
@@ -2271,7 +2484,7 @@ async def handle_ifsc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_IFSC
         
     user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context)
+    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='ifsc')
     if not allowed:
         await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
         return ConversationHandler.END
@@ -2432,6 +2645,12 @@ async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send support ticket to admin {admin_id}: {e}")
             
     if admin_notified > 0:
+        db.tickets.insert_one({
+            "user_id": user_id,
+            "message": message_text,
+            "submitted_at": datetime.utcnow(),
+            "status": "pending"
+        })
         await update.message.reply_text(
             "✅ <b>Support Ticket Submitted!</b>\n━━━━━━━━━━━━━━━━━━━━\nYour query has been forwarded to the administration. We will reply to you shortly.",
             parse_mode='HTML'
@@ -2467,6 +2686,10 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=target_id,
             text=f"📩 <b>SUPPORT REPLY</b>\n━━━━━━━━━━━━━━━━━━━━\n🛠️ <b>Admin Team:</b> <i>{escape_html(reply_text)}</i>\n━━━━━━━━━━━━━━━━━━━━",
             parse_mode='HTML'
+        )
+        db.tickets.update_many(
+            {"user_id": target_id, "status": "pending"},
+            {"$set": {"status": "replied", "replied_at": datetime.utcnow()}}
         )
         await update.message.reply_text(f"✅ Reply successfully sent to User ID <code>{target_id}</code>.", parse_mode='HTML')
     except Exception as e:
@@ -2762,6 +2985,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             pass
 
+async def post_init(application: Application) -> None:
+    """Async startup task initialization"""
+    asyncio.create_task(update_api_status_loop())
+
 # ==================== MAIN ====================
 
 def main():
@@ -2778,7 +3005,7 @@ def main():
     if "PORT" in os.environ:
         threading.Thread(target=run_dummy_server, daemon=True).start()
         
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_error_handler(error_handler)
     
     # Conversation handler for button flow
