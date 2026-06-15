@@ -28,7 +28,6 @@ STARTUP_TIME = datetime.utcnow()
 API_STATUSES = {
     "mobile": "🟢",
     "pan": "🟢",
-    "ifsc": "🟢",
     "vehicle1": "🟢",
     "vehicle2": "🟢",
     "leak": "🟢",
@@ -45,7 +44,6 @@ VEHICLE_API_2 = "https://vehicle-api-pkbw.onrender.com/api/rc?vehicle_no={}"
 PAN_API = "https://pan-info-api-1098.onrender.com/pan={}"
 LEAK_API = "https://lynn-tracker-ref-contained.trycloudflare.com/leak={}"
 GITHUB_API = "https://api.github.com/users/{}"
-IFSC_API = "https://ifsc-api-ntb4.onrender.com/ifsc?ifsc={}"
 
 # Conversation states
 WAITING_MOBILE = 2
@@ -53,7 +51,6 @@ WAITING_VEHICLE = 3
 WAITING_PAN = 4
 WAITING_GITHUB = 5
 WAITING_LEAK = 6
-WAITING_IFSC = 7
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -494,7 +491,6 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vehicle_count = queries_by_type.get('vehicle1', 0) + queries_by_type.get('vehicle2', 0)
     pan_count = queries_by_type.get('pan', 0)
     leak_count = queries_by_type.get('leak', 0)
-    ifsc_count = queries_by_type.get('ifsc', 0)
     github_count = queries_by_type.get('github', 0)
     
     pop_list = [
@@ -502,7 +498,6 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("🚗 Vehicle", vehicle_count),
         ("📄 PAN", pan_count),
         ("🕵️ Leak", leak_count),
-        ("🏦 IFSC", ifsc_count),
         ("💻 GitHub", github_count)
     ]
     pop_list.sort(key=lambda x: x[1], reverse=True)
@@ -579,7 +574,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 🎫 <b>Pending Support:</b> <code>{pending_tickets} tickets</code> {"⚠️" if pending_tickets > 0 else ""}
 
 🔌 <b>API STATUS:</b>
-• 📱 Mobile: {API_STATUSES.get('mobile', '🟢')} | 📄 PAN: {API_STATUSES.get('pan', '🟢')} | 🏦 IFSC: {API_STATUSES.get('ifsc', '🟢')}
+• 📱 Mobile: {API_STATUSES.get('mobile', '🟢')} | 📄 PAN: {API_STATUSES.get('pan', '🟢')}
 • 🚗 Vehicle 1: {API_STATUSES.get('vehicle1', '🟢')} | 🚙 Vehicle 2: {API_STATUSES.get('vehicle2', '🟢')} | 🕵️ Leak: {API_STATUSES.get('leak', '🟢')}
 
 ⚡ <b>SYSTEM INFO:</b>
@@ -934,7 +929,6 @@ async def update_api_status_loop():
         "vehicle2": VEHICLE_API_2.format("DL3CAS1234"),
         "pan": PAN_API.format("ABCDE1234F"),
         "github": GITHUB_API.format("octocat"),
-        "ifsc": IFSC_API.format("SBIN0001234"),
         "leak": LEAK_API.format("test@gmail.com")
     }
     
@@ -1414,58 +1408,7 @@ async def search_github_info(username: str, masked: bool = False) -> str:
         logger.error(f"GitHub search error: {e}")
         return handle_api_exception("GitHub API", e)
 
-async def search_ifsc_info(ifsc: str, masked: bool = False) -> str:
-    """Search bank information by IFSC code"""
-    try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, lambda: requests.get(IFSC_API.format(ifsc), timeout=15)
-        )
-        data = response.json()
-        
-        if isinstance(data, dict):
-            if data.get('error') or 'message' in data and not data.get('BANK'):
-                return format_error("IFSC Error", data.get('message', 'IFSC not found'))
-                
-            if data.get('BANK'):
-                result = format_header("🏦", "BANK DETAILS (IFSC)") + "\n"
-                result += add_field("🏛️", "Bank", mask_val(data.get('BANK')) if masked else data.get('BANK'), False)
-                result += add_field("🌿", "Branch", mask_val(data.get('BRANCH')) if masked else data.get('BRANCH'), False)
-                result += add_field("🆔", "IFSC", mask_val(data.get('IFSC'), is_phone=True) if masked else data.get('IFSC'))
-                result += add_field("🏢", "Bank Code", mask_val(data.get('BANKCODE'), is_phone=True) if masked else data.get('BANKCODE'))
-                result += add_field("🔢", "MICR", mask_val(data.get('MICR'), is_phone=True) if masked else data.get('MICR'))
-                
-                # Branch details
-                city = data.get('CITY')
-                centre = data.get('CENTRE')
-                district = data.get('DISTRICT')
-                details_list = [x for x in [city, centre, district] if x and str(x).upper() not in ['', 'N/A', 'NA', 'NONE', 'NULL']]
-                if details_list:
-                    result += add_field("📍", "Branch Details", mask_val(", ".join(details_list)) if masked else ", ".join(details_list), False)
-                    
-                result += add_field("🗺️", "State", mask_val(data.get('STATE')) if masked else data.get('STATE'), False)
-                result += format_separator() + "\n"
-                
-                # Payment modes
-                def check_status(val):
-                    return "✅" if val else "❌"
-                    
-                result += f"⚡ <b>UPI:</b> {check_status(data.get('UPI'))}\n"
-                result += f"🔄 <b>IMPS:</b> {check_status(data.get('IMPS'))}\n"
-                result += f"💸 <b>NEFT:</b> {check_status(data.get('NEFT'))}\n"
-                result += f"💼 <b>RTGS:</b> {check_status(data.get('RTGS'))}\n"
-                result += add_field("🌐", "SWIFT", mask_val(data.get('SWIFT'), is_phone=True) if masked else data.get('SWIFT'))
-                result += format_separator() + "\n"
-                
-                result += add_field("📍", "Address", mask_val(data.get('ADDRESS')) if masked else data.get('ADDRESS'), False)
-                
-                return result.strip()
-                
-        return format_no_results(ifsc)
-        
-    except Exception as e:
-        logger.error(f"IFSC search error: {e}")
-        return handle_api_exception("IFSC API", e)
+
 
 def format_leak_page(results, query, page_index=0, masked=False):
     """Format a single page of leak results (5 records per page) and return (text, reply_markup)"""
@@ -1866,37 +1809,7 @@ async def leak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     await msg.edit_text(text, reply_markup=reply_markup, parse_mode='HTML', disable_web_page_preview=True)
 
-async def ifsc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Direct IFSC search command"""
-    if not context.args:
-        await update.message.reply_text(
-            format_error("Missing Input", "Usage: /ifsc SBIN0001234"),
-            parse_mode='HTML'
-        )
-        return
-        
-    ifsc = context.args[0].strip().upper()
-    if len(ifsc) != 11:
-        await update.message.reply_text(
-            format_error("Invalid Input", "IFSC code must be exactly 11 characters\nExample: SBIN0001234"),
-            parse_mode='HTML'
-        )
-        return
-    
-    user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='ifsc')
-    if not allowed:
-        await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
-        return
-        
-    msg = await update.message.reply_text("🔍 <b>Searching bank details...</b>", parse_mode='HTML')
-    result = await search_ifsc_info(ifsc, masked=masked)
-    
-    if masked:
-        result = append_lock_message(result)
-        reply_markup = get_masked_keyboard()
-        
-    await send_formatted_message(update, result, msg, reply_markup=reply_markup)
+
 
 # ==================== CONVERSATION HANDLERS ====================
 
@@ -1914,7 +1827,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
         
     # Pre-check search query options for bans, maintenance, and force join
-    if option in ['mobile', 'vehicle1', 'vehicle2', 'pan', 'github', 'leak', 'ifsc']:
+    if option in ['mobile', 'vehicle1', 'vehicle2', 'pan', 'github', 'leak']:
         allowed, masked, err_msg, reply_markup = await check_user_access(update.effective_user, context, deduct_credit=False)
         if not allowed:
             if err_msg == FORCE_JOIN_TEXT:
@@ -1966,8 +1879,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("🕵️ Leak OSINT", callback_data='leak')],
             [InlineKeyboardButton("🚗 Vehicle API 1", callback_data='vehicle1'),
              InlineKeyboardButton("🚙 Vehicle API 2", callback_data='vehicle2')],
-            [InlineKeyboardButton("📄 PAN Card", callback_data='pan'),
-             InlineKeyboardButton("🏦 IFSC Details", callback_data='ifsc')],
+            [InlineKeyboardButton("📄 PAN Card", callback_data='pan')],
             [InlineKeyboardButton("💻 GitHub Lookup", callback_data='github')],
             [InlineKeyboardButton("🔙 Back to Home", callback_data='start')]
         ]
@@ -1982,7 +1894,6 @@ Select one of the query types below or use the quick commands to start searching
 • 📄 PAN: <code>/pan ABCDE1234F</code>
 • 💻 GitHub: <code>/github username</code>
 • 🕵️ Leak: <code>/leak email_or_phone</code>
-• 🏦 IFSC: <code>/ifsc SBIN0001234</code>
 ━━━━━━━━━━━━━━━━━━━━"""
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return ConversationHandler.END
@@ -1998,8 +1909,7 @@ Select one of the query types below or use the quick commands to start searching
                  InlineKeyboardButton("🕵️ Leak OSINT", callback_data='leak')],
                 [InlineKeyboardButton("🚗 Vehicle API 1", callback_data='vehicle1'),
                  InlineKeyboardButton("🚙 Vehicle API 2", callback_data='vehicle2')],
-                [InlineKeyboardButton("📄 PAN Card", callback_data='pan'),
-                 InlineKeyboardButton("🏦 IFSC Details", callback_data='ifsc')],
+                [InlineKeyboardButton("📄 PAN Card", callback_data='pan')],
                 [InlineKeyboardButton("💻 GitHub Lookup", callback_data='github')],
                 [InlineKeyboardButton("🔙 Back to Home", callback_data='start')]
             ]
@@ -2014,7 +1924,6 @@ Select one of the query types below or use the quick commands to start searching
 • 📄 PAN: <code>/pan ABCDE1234F</code>
 • 💻 GitHub: <code>/github username</code>
 • 🕵️ Leak: <code>/leak email_or_phone</code>
-• 🏦 IFSC: <code>/ifsc SBIN0001234</code>
 ━━━━━━━━━━━━━━━━━━━━"""
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         else:
@@ -2065,10 +1974,6 @@ Get free search credits to run queries:
 📄 <b>PAN Card Lookup</b>
 <code>/pan [pan_number]</code>
 ↳ <i>Finds Full Name, Father's Name, DOB, Income, and Phone.</i>
-
-🏦 <b>Bank IFSC Lookup</b>
-<code>/ifsc [ifsc_code]</code>
-↳ <i>Finds Bank Name, Branch, Location, state, and payment support.</i>
 
 🕵️ <b>OSINT Leak Breaches</b>
 <code>/leak [email_or_phone]</code>
@@ -2473,31 +2378,7 @@ async def handle_leak(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(text, reply_markup=reply_markup, parse_mode='HTML', disable_web_page_preview=True)
     return ConversationHandler.END
 
-async def handle_ifsc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle IFSC input from conversation"""
-    ifsc = update.message.text.strip().upper()
-    if len(ifsc) != 11:
-        await update.message.reply_text(
-            format_error("Invalid Input", "IFSC code must be exactly 11 characters\nExample: SBIN0001234"),
-            parse_mode='HTML'
-        )
-        return WAITING_IFSC
-        
-    user = update.effective_user
-    allowed, masked, err_msg, reply_markup = await check_user_access(user, context, query_type='ifsc')
-    if not allowed:
-        await update.message.reply_text(err_msg, reply_markup=reply_markup, parse_mode='HTML')
-        return ConversationHandler.END
-        
-    msg = await update.message.reply_text("🔍 <b>Searching bank details...</b>", parse_mode='HTML')
-    result = await search_ifsc_info(ifsc, masked=masked)
-    
-    if masked:
-        result = append_lock_message(result)
-        reply_markup = get_masked_keyboard()
-        
-    await send_formatted_message(update, result, msg, reply_markup=reply_markup)
-    return ConversationHandler.END
+
 
 # ==================== NEW FEATURES & COMMANDS ====================
 
@@ -2866,10 +2747,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <code>/pan [pan_number]</code>
 ↳ <i>Finds Full Name, Father's Name, DOB, Income, and Phone.</i>
 
-🏦 <b>Bank IFSC Lookup</b>
-<code>/ifsc [ifsc_code]</code>
-↳ <i>Finds Bank Name, Branch, Location, state, and payment support.</i>
-
 🕵️ <b>OSINT Leak Breaches</b>
 <code>/leak [email_or_phone]</code>
 ↳ <i>Finds database leak credentials and breach source.</i>
@@ -3017,7 +2894,6 @@ def main():
             WAITING_PAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_pan)), CallbackQueryHandler(private_chat_only(button_handler))],
             WAITING_GITHUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_github)), CallbackQueryHandler(private_chat_only(button_handler))],
             WAITING_LEAK: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_leak)), CallbackQueryHandler(private_chat_only(button_handler))],
-            WAITING_IFSC: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_chat_only(handle_ifsc)), CallbackQueryHandler(private_chat_only(button_handler))],
         },
         fallbacks=[CommandHandler('cancel', private_chat_only(cancel))],
     )
@@ -3040,7 +2916,6 @@ def main():
     app.add_handler(CommandHandler('pan', private_chat_only(pan_cmd)))
     app.add_handler(CommandHandler('github', private_chat_only(github_cmd)))
     app.add_handler(CommandHandler('leak', private_chat_only(leak_cmd)))
-    app.add_handler(CommandHandler('ifsc', private_chat_only(ifsc_cmd)))
     app.add_handler(CommandHandler('checkin', private_chat_only(checkin_cmd)))
     app.add_handler(CommandHandler('leaderboard', private_chat_only(leaderboard_cmd)))
     app.add_handler(CommandHandler('support', private_chat_only(support_cmd)))
