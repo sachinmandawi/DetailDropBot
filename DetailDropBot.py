@@ -48,7 +48,7 @@ API_STATUSES = {
 }
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAEX46N64eLaD4ZFJDCVRTjeS6xeRSE31FU")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # API URLs
 MOBILE_API = "https://numberto-info-noobster.com-dashbord63hh7qe4.workers.dev/?number={}"
@@ -73,7 +73,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== MONGODB & ACCESS CONFIG ====================
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://TGHostingManagerBot:Z15kgFLgaOLUA84a@tghostingmanagerbot.pz1om5f.mongodb.net/")
+MONGO_URI = os.environ.get("MONGO_URI", "")
 ADMIN_IDS = [8464435078]
 ADMIN_USERNAME = "NeoVirtuosa"
 
