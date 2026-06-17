@@ -5,6 +5,19 @@ Multi-source intelligence search bot - Uniform Format v3.0
 """
 
 import requests
+import socket
+
+# Force IPv4 to prevent IPv6 connection timeouts (common in environments with broken IPv6 routes)
+old_getaddrinfo = socket.getaddrinfo
+def new_getaddrinfo(*args, **kwargs):
+    args_list = list(args)
+    if len(args_list) >= 3:
+        args_list[2] = socket.AF_INET
+    else:
+        kwargs['family'] = socket.AF_INET
+    return old_getaddrinfo(*args_list, **kwargs)
+socket.getaddrinfo = new_getaddrinfo
+
 import json
 import logging
 import re
