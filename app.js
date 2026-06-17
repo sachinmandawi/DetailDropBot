@@ -346,17 +346,21 @@ async function executeQuery(type, queryVal, endpointUrl) {
         let data;
         const responseText = await response.text();
         
-        // Handle allorigins specific proxy wrap if active
-        if (useProxy && proxyUrl.includes("allorigins")) {
-            const wrapData = JSON.parse(responseText);
-            data = JSON.parse(wrapData.contents);
-        } else {
-            try {
-                data = JSON.parse(responseText);
-            } catch (e) {
-                // If not JSON, treat it as raw text
-                data = { raw_text: responseText };
+        try {
+            const parsed = JSON.parse(responseText);
+            // Check if it's a wrapped proxy response (like AllOrigins /get)
+            if (parsed && typeof parsed === "object" && "contents" in parsed) {
+                try {
+                    data = JSON.parse(parsed.contents);
+                } catch (innerErr) {
+                    data = { raw_text: parsed.contents };
+                }
+            } else {
+                data = parsed;
             }
+        } catch (e) {
+            // If it's HTML or plain text, treat it as raw text
+            data = { raw_text: responseText };
         }
         
         lastRawResponse = data;
