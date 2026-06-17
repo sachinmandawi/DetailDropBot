@@ -20,7 +20,6 @@
 - 🚗 **Double Vehicle APIs:** Supports fallback routing between two high-performance RTO databases.
 - 📄 **PAN Card Lookup:** Name, Father's Name, DOB, Gender, Income and Address.
 - 🕵️ **Leak OSINT Search:** Custom Cloudflare tunnel integration for email/phone leak databases with pagination.
-- 🏦 **IFSC Bank Lookup:** Complete branch state, MICR, UPI, IMPS, NEFT, and RTGS payment statuses.
 - 🎟️ **Promo Codes & Referral System:** Integrated dynamic credit rewards (+2 per referral) and free time-based passes.
 - 🔐 **Force Join Verification:** Precise group and channel membership checks with custom top-bar Telegram alerts.
 
@@ -63,7 +62,6 @@ To deploy **DetailDropBot**, set the following environment variables:
 * `/vehicle2 <RC>` — Check RTO database (API 2)
 * `/pan <PAN>` — Retrieve PAN card record
 * `/leak <email_or_phone>` — Scan leak databases
-* `/ifsc <IFSC>` — View bank branch payment details
 
 ### 👥 User Controls
 * `/start` — Launch user menu panel
