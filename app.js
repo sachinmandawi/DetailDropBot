@@ -344,34 +344,46 @@ async function executeQuery(type, queryVal, endpointUrl) {
     try {
         const response = await fetch(finalUrl);
         
-        if (!response.ok) {
-            throw new Error(`Server returned HTTP status ${response.status}`);
-        }
-        
-        let data;
-        const responseText = await response.text();
+        let data = null;
+        let responseText = "";
         
         try {
-            const parsed = JSON.parse(responseText);
-            // Check if it's a wrapped proxy response (like AllOrigins /get)
-            if (parsed && typeof parsed === "object" && "contents" in parsed) {
-                try {
-                    data = JSON.parse(parsed.contents);
-                } catch (innerErr) {
-                    data = { raw_text: parsed.contents };
+            responseText = await response.text();
+        } catch (readErr) {
+            // Failed to read body
+        }
+        
+        if (responseText) {
+            try {
+                const parsed = JSON.parse(responseText);
+                // Check if it's a wrapped proxy response (like AllOrigins /get)
+                if (parsed && typeof parsed === "object" && "contents" in parsed) {
+                    try {
+                        data = JSON.parse(parsed.contents);
+                    } catch (innerErr) {
+                        data = { raw_text: parsed.contents };
+                    }
+                } else {
+                    data = parsed;
                 }
-            } else {
-                data = parsed;
+            } catch (e) {
+                // If it's HTML or plain text, treat it as raw text
+                data = { raw_text: responseText };
             }
-        } catch (e) {
-            // If it's HTML or plain text, treat it as raw text
-            data = { raw_text: responseText };
         }
         
         lastRawResponse = data;
         
-        // Render
-        renderResults(data);
+        if (!response.ok) {
+            if (response.status === 404) {
+                renderResults(data, 404);
+            } else {
+                throw new Error(`Server returned HTTP status ${response.status}`);
+            }
+        } else {
+            // Render
+            renderResults(data, 200);
+        }
         
         // Increment search count
         queryCount++;
@@ -393,13 +405,23 @@ async function executeQuery(type, queryVal, endpointUrl) {
 // ==========================================================
 // DOM RENDERING HELPERS
 // ==========================================================
-function renderResults(data) {
+function renderResults(data, status = 200) {
     resultsDisplay.innerHTML = "";
+    
+    if (status === 404) {
+        resultsDisplay.innerHTML = `
+            <div class="result-error" style="color: var(--text-secondary); padding: 3rem 1.5rem; grid-column: 1 / -1;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 52px; height: 52px; stroke: var(--accent-violet); margin-bottom: 0.5rem;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <span style="font-size: 1.25rem; font-weight: 600; color: #fff;">No Records Found</span>
+                <p style="font-size: 0.9rem; color: var(--text-muted); margin-top: 0.5rem; max-width: 450px; margin-left: auto; margin-right: auto; line-height: 1.5;">The query executed successfully, but no matching intelligence records were found in the database registry.</p>
+            </div>`;
+        return;
+    }
     
     // If empty or empty object
     if (!data || Object.keys(data).length === 0) {
         resultsDisplay.innerHTML = `
-            <div class="result-error">
+            <div class="result-error" style="grid-column: 1 / -1;">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
                 <span>No intelligence data found for this query in registries.</span>
             </div>`;
