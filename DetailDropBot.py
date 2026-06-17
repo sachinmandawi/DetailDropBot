@@ -35,7 +35,7 @@ API_STATUSES = {
 }
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAFzsIOx2mWpxbXNdqlO7rr0n_BsxbTdYM4")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAEX46N64eLaD4ZFJDCVRTjeS6xeRSE31FU")
 
 # API URLs
 MOBILE_API = "https://numberto-info-noobster.com-dashbord63hh7qe4.workers.dev/?number={}"
