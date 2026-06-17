@@ -2895,7 +2895,11 @@ def main():
     if "PORT" in os.environ:
         threading.Thread(target=run_dummy_server, daemon=True).start()
         
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    proxy_url = os.environ.get("TELEGRAM_PROXY")
+    builder = Application.builder().token(BOT_TOKEN).post_init(post_init)
+    if proxy_url:
+        builder = builder.proxy(proxy_url)
+    app = builder.build()
     app.add_error_handler(error_handler)
     
     # Conversation handler for button flow
