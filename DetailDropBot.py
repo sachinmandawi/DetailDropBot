@@ -5,19 +5,6 @@ Multi-source intelligence search bot - Uniform Format v3.0
 """
 
 import requests
-import socket
-
-# Force IPv4 to prevent IPv6 connection timeouts (common in environments with broken IPv6 routes)
-old_getaddrinfo = socket.getaddrinfo
-def new_getaddrinfo(*args, **kwargs):
-    args_list = list(args)
-    if len(args_list) >= 3:
-        args_list[2] = socket.AF_INET
-    else:
-        kwargs['family'] = socket.AF_INET
-    return old_getaddrinfo(*args_list, **kwargs)
-socket.getaddrinfo = new_getaddrinfo
-
 import json
 import logging
 import re
@@ -48,7 +35,7 @@ API_STATUSES = {
 }
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8683454343:AAFzsIOx2mWpxbXNdqlO7rr0n_BsxbTdYM4")
 
 # API URLs
 MOBILE_API = "https://numberto-info-noobster.com-dashbord63hh7qe4.workers.dev/?number={}"
@@ -73,7 +60,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== MONGODB & ACCESS CONFIG ====================
-MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://TGHostingManagerBot:Z15kgFLgaOLUA84a@tghostingmanagerbot.pz1om5f.mongodb.net/")
 ADMIN_IDS = [8464435078]
 ADMIN_USERNAME = "NeoVirtuosa"
 
@@ -2123,15 +2110,6 @@ If you face any issues, submit a support ticket using:
         )
         return WAITING_LEAK
         
-    elif option == 'ifsc':
-        keyboard = [[InlineKeyboardButton("🔙 Back to Search", callback_data='menu_search')]]
-        await query.edit_message_text(
-            "🏦 Send IFSC code:\nExample: <code>SBIN0001234</code>",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-        return WAITING_IFSC
-        
     elif option == 'start':
         await start(update, context)
         return ConversationHandler.END
@@ -2403,7 +2381,6 @@ async def check_api_health() -> str:
         "Vehicle API 2": VEHICLE_API_2.format("DL3CAS1234"),
         "PAN API": PAN_API.format("ABCDE1234F"),
         "GitHub API": GITHUB_API.format("octocat"),
-        "IFSC API": IFSC_API.format("SBIN0001234"),
         "Leak API": LEAK_API.format("test@gmail.com")
     }
     
@@ -2895,11 +2872,7 @@ def main():
     if "PORT" in os.environ:
         threading.Thread(target=run_dummy_server, daemon=True).start()
         
-    proxy_url = os.environ.get("TELEGRAM_PROXY")
-    builder = Application.builder().token(BOT_TOKEN).post_init(post_init)
-    if proxy_url:
-        builder = builder.proxy(proxy_url)
-    app = builder.build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_error_handler(error_handler)
     
     # Conversation handler for button flow
