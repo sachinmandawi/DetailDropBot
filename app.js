@@ -92,7 +92,12 @@ function loadSettings() {
         useCorsProxyCheck.checked = savedUseProxy === "true";
     }
     if (savedProxyUrl !== null) {
-        corsProxyUrlInput.value = savedProxyUrl;
+        if (savedProxyUrl === "https://api.allorigins.win/raw?url=") {
+            corsProxyUrlInput.value = "https://corsproxy.io/?";
+            localStorage.setItem("dd_proxy_url", "https://corsproxy.io/?");
+        } else {
+            corsProxyUrlInput.value = savedProxyUrl;
+        }
     }
     if (savedQueryCount !== null) {
         queryCount = parseInt(savedQueryCount) || 0;
